@@ -415,6 +415,7 @@ fn collect_new_statistics(
                     max_value,
                     min_value,
                     distinct_count: distinct_count.to_inexact(),
+                    byte_size: input_column_stats[idx].byte_size.to_inexact(),
                 }
             },
         )

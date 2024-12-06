@@ -585,6 +585,8 @@ pub fn statistics_from_parquet_meta_calc(
         let (mut max_accs, mut min_accs) = create_max_min_accs(&table_schema);
         let mut null_counts_array =
             vec![Precision::Exact(0); table_schema.fields().len()];
+        let mut uncompressed_sizes_array =
+            vec![Precision::Exact(0_usize); table_schema.fields().len()];
 
         table_schema
             .fields()
@@ -597,10 +599,11 @@ pub fn statistics_from_parquet_meta_calc(
                     file_metadata.schema_descr(),
                 ) {
                     Ok(stats_converter) => {
-                        summarize_min_max_null_counts(
+                        summarize_file_statistics(
                             &mut min_accs,
                             &mut max_accs,
                             &mut null_counts_array,
+                            &mut uncompressed_sizes_array,
                             idx,
                             num_rows,
                             &stats_converter,
@@ -618,6 +621,7 @@ pub fn statistics_from_parquet_meta_calc(
         get_col_stats(
             &table_schema,
             null_counts_array,
+            uncompressed_sizes_array,
             &mut max_accs,
             &mut min_accs,
         )
@@ -643,10 +647,11 @@ pub async fn statistics_from_parquet_meta(
     statistics_from_parquet_meta_calc(metadata, table_schema)
 }
 
-fn summarize_min_max_null_counts(
+fn summarize_file_statistics(
     min_accs: &mut [Option<MinAccumulator>],
     max_accs: &mut [Option<MaxAccumulator>],
     null_counts_array: &mut [Precision<usize>],
+    uncompressed_sizes_array: &mut [Precision<usize>],
     arrow_schema_index: usize,
     num_rows: usize,
     stats_converter: &StatisticsConverter,
@@ -655,6 +660,8 @@ fn summarize_min_max_null_counts(
     let max_values = stats_converter.row_group_maxes(row_groups_metadata)?;
     let min_values = stats_converter.row_group_mins(row_groups_metadata)?;
     let null_counts = stats_converter.row_group_null_counts(row_groups_metadata)?;
+    let uncompressed_sizes =
+        stats_converter.row_group_uncompressed_size(row_groups_metadata)?;
 
     if let Some(max_acc) = &mut max_accs[arrow_schema_index] {
         max_acc.update_batch(&[max_values])?;
@@ -668,6 +675,9 @@ fn summarize_min_max_null_counts(
         Some(null_count) => null_count as usize,
         None => num_rows,
     });
+
+    uncompressed_sizes_array[arrow_schema_index] =
+        Precision::Exact(sum(&uncompressed_sizes).unwrap_or_default() as usize);
 
     Ok(())
 }
@@ -1577,6 +1587,8 @@ mod tests {
         let c2_stats = &stats.column_statistics[1];
         assert_eq!(c1_stats.null_count, Precision::Exact(1));
         assert_eq!(c2_stats.null_count, Precision::Exact(3));
+        assert_eq!(c1_stats.byte_size, Precision::Exact(70));
+        assert_eq!(c2_stats.byte_size, Precision::Exact(0));
 
         let store = Arc::new(RequestCountingObjectStore::new(Arc::new(
             LocalFileSystem::new(),
@@ -1612,6 +1624,8 @@ mod tests {
         let c2_stats = &stats.column_statistics[1];
         assert_eq!(c1_stats.null_count, Precision::Exact(1));
         assert_eq!(c2_stats.null_count, Precision::Exact(3));
+        assert_eq!(c1_stats.byte_size, Precision::Exact(70));
+        assert_eq!(c2_stats.byte_size, Precision::Exact(0));
 
         let store = Arc::new(RequestCountingObjectStore::new(Arc::new(
             LocalFileSystem::new(),

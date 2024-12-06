@@ -351,12 +351,14 @@ fn stats_cartesian_product(
             distinct_count: s.distinct_count,
             min_value: s.min_value,
             max_value: s.max_value,
+            byte_size: s.byte_size,
         })
         .chain(right_col_stats.into_iter().map(|s| ColumnStatistics {
             null_count: s.null_count.multiply(&left_row_count),
             distinct_count: s.distinct_count,
             min_value: s.min_value,
             max_value: s.max_value,
+            byte_size: s.byte_size,
         }))
         .collect();
 

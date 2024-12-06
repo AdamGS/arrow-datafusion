@@ -114,6 +114,7 @@ pub async fn get_statistics_with_limit(
                         max_value: file_max,
                         min_value: file_min,
                         distinct_count: _,
+                        byte_size: _,
                     } = file_col_stats;
 
                     col_stats.null_count = add_row_stats(*file_nc, col_stats.null_count);
@@ -187,6 +188,7 @@ fn add_row_stats(
 pub(crate) fn get_col_stats(
     schema: &Schema,
     null_counts: Vec<Precision<usize>>,
+    uncompressed_sizes: Vec<Precision<usize>>,
     max_values: &mut [Option<MaxAccumulator>],
     min_values: &mut [Option<MinAccumulator>],
 ) -> Vec<ColumnStatistics> {
@@ -202,6 +204,7 @@ pub(crate) fn get_col_stats(
             };
             ColumnStatistics {
                 null_count: null_counts[i],
+                byte_size: uncompressed_sizes[i],
                 max_value: max_value.map(Precision::Exact).unwrap_or(Precision::Absent),
                 min_value: min_value.map(Precision::Exact).unwrap_or(Precision::Absent),
                 distinct_count: Precision::Absent,

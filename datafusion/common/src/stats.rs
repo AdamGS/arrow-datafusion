@@ -438,6 +438,8 @@ pub struct ColumnStatistics {
     pub min_value: Precision<ScalarValue>,
     /// Number of distinct values
     pub distinct_count: Precision<usize>,
+    /// Total bytes of the column values.
+    pub byte_size: Precision<usize>,
 }
 
 impl ColumnStatistics {
@@ -459,6 +461,7 @@ impl ColumnStatistics {
             max_value: Precision::Absent,
             min_value: Precision::Absent,
             distinct_count: Precision::Absent,
+            byte_size: Precision::Absent,
         }
     }
 
@@ -470,6 +473,7 @@ impl ColumnStatistics {
         self.max_value = self.max_value.to_inexact();
         self.min_value = self.min_value.to_inexact();
         self.distinct_count = self.distinct_count.to_inexact();
+        self.byte_size = self.byte_size.to_inexact();
         self
     }
 }
@@ -647,6 +651,7 @@ mod tests {
             max_value: Precision::Exact(ScalarValue::Int64(Some(42))),
             min_value: Precision::Exact(ScalarValue::Int64(Some(64))),
             distinct_count: Precision::Exact(100),
+            byte_size: Precision::Exact(168),
         }
     }
 }
