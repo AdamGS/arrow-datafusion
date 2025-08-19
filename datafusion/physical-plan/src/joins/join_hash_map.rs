@@ -24,6 +24,7 @@ use std::ops::Sub;
 
 use hashbrown::hash_table::Entry::{Occupied, Vacant};
 use hashbrown::HashTable;
+use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 
 /// Maps a `u64` hash value based on the build side ["on" values] to a list of indices with this key's value.
 ///
@@ -254,39 +255,73 @@ impl JoinHashMapType for JoinHashMapU64 {
 // Type of offsets for obtaining indices from JoinHashMap.
 pub(crate) type JoinHashMapOffset = (usize, Option<u64>);
 
-// Macro for traversing chained values with limit.
-// Early returns in case of reaching output tuples limit.
-macro_rules! chain_traverse {
-    (
-        $input_indices:ident, $match_indices:ident,
-        $hash_values:ident, $next_chain:ident,
-        $input_idx:ident, $chain_idx:ident, $remaining_output:ident, $one:ident, $zero:ident
-    ) => {{
-        // now `one` and `zero` are in scope from the outer function
-        let mut match_row_idx = $chain_idx - $one;
-        loop {
-            $match_indices.push(match_row_idx.into());
-            $input_indices.push($input_idx as u32);
-            $remaining_output -= 1;
+// Result of chain traversal
+enum ChainTraverseResult {
+    // Chain completed normally
+    Completed,
+    // Limit reached, return early with this offset
+    LimitReached(Option<JoinHashMapOffset>),
+}
 
-            let next = $next_chain[match_row_idx.into() as usize];
+// Generic function for traversing chained values with limit using spare_capacity writes.
+#[inline]
+fn chain_traverse<T>(
+    input_indices: &mut Vec<u32>,
+    match_indices: &mut Vec<u64>,
+    write_pos: &mut usize,
+    next_chain: &[T],
+    hash_values_len: usize,
+    input_idx: usize,
+    chain_idx: T,
+    remaining_output: &mut usize,
+) -> ChainTraverseResult
+where
+    T: Copy + PartialOrd + Sub<Output = T> + Zero + One + ToPrimitive + FromPrimitive,
+{
+    let mut current_write_pos = *write_pos;
+    let mut match_row_idx = chain_idx - T::one();
 
-            if $remaining_output == 0 {
-                // we compare against `zero` (of type T) here too
-                let next_offset = if $input_idx == $hash_values.len() - 1 && next == $zero
-                {
-                    None
-                } else {
-                    Some(($input_idx, Some(next.into())))
-                };
-                return ($input_indices, $match_indices, next_offset);
-            }
-            if next == $zero {
-                break;
-            }
-            match_row_idx = next - $one;
+    // Pre-calculate limit to avoid counter decrement in loop
+    let limit_write_pos = current_write_pos + *remaining_output;
+
+    // Get spare capacity for direct writes
+    let input_spare = input_indices.spare_capacity_mut();
+    let match_spare = match_indices.spare_capacity_mut();
+
+    let input_idx_u32 = input_idx as u32;
+
+    loop {
+        let match_row_idx_u64 = match_row_idx.to_u64().unwrap();
+
+        input_spare[current_write_pos].write(input_idx_u32);
+        match_spare[current_write_pos].write(match_row_idx_u64);
+        current_write_pos += 1;
+
+        let next = next_chain[match_row_idx_u64 as usize];
+        let next_is_zero = next.is_zero();
+
+        if current_write_pos >= limit_write_pos {
+            println!("a");
+            *write_pos = current_write_pos;
+            *remaining_output = 0;
+            let next_offset = if input_idx == hash_values_len - 1 && next_is_zero {
+                None
+            } else {
+                Some((input_idx, Some(next.to_u64().unwrap())))
+            };
+            return ChainTraverseResult::LimitReached(next_offset);
+        } else if next_is_zero {
+            println!("b");
+            break;
+        } else {
+            println!("c");
+            match_row_idx = next - T::one();
         }
-    }};
+    }
+
+    *write_pos = current_write_pos;
+    *remaining_output = limit_write_pos - current_write_pos;
+    ChainTraverseResult::Completed
 }
 
 pub fn update_from_iter<'a, T>(
@@ -295,8 +330,7 @@ pub fn update_from_iter<'a, T>(
     iter: Box<dyn Iterator<Item = (usize, &'a u64)> + Send + 'a>,
     deleted_offset: usize,
 ) where
-    T: Copy + TryFrom<usize> + PartialOrd,
-    <T as TryFrom<usize>>::Error: Debug,
+    T: Copy + PartialOrd + FromPrimitive,
 {
     for (row, &hash_value) in iter {
         let entry = map.entry(
@@ -311,12 +345,12 @@ pub fn update_from_iter<'a, T>(
                 let (_, index) = occupied_entry.get_mut();
                 let prev_index = *index;
                 // Store new value inside hashmap
-                *index = T::try_from(row + 1).unwrap();
+                *index = T::from_usize(row + 1).unwrap();
                 // Update chained Vec at `row` with previous value
                 next[row - deleted_offset] = prev_index;
             }
             Vacant(vacant_entry) => {
-                vacant_entry.insert((hash_value, T::try_from(row + 1).unwrap()));
+                vacant_entry.insert((hash_value, T::from_usize(row + 1).unwrap()));
             }
         }
     }
@@ -329,22 +363,19 @@ pub fn get_matched_indices<'a, T>(
     deleted_offset: Option<usize>,
 ) -> (Vec<u32>, Vec<u64>)
 where
-    T: Copy + TryFrom<usize> + PartialOrd + Into<u64> + Sub<Output = T>,
-    <T as TryFrom<usize>>::Error: Debug,
+    T: Copy + PartialOrd + Sub<Output = T> + Zero + One + ToPrimitive + FromPrimitive,
 {
     let mut input_indices = vec![];
     let mut match_indices = vec![];
-    let zero = T::try_from(0).unwrap();
-    let one = T::try_from(1).unwrap();
 
     for (row_idx, hash_value) in iter {
         // Get the hash and find it in the index
         if let Some((_, index)) = map.find(*hash_value, |(hash, _)| *hash_value == *hash)
         {
-            let mut i = *index - one;
+            let mut i = *index - T::one();
             loop {
                 let match_row_idx = if let Some(offset) = deleted_offset {
-                    let offset = T::try_from(offset).unwrap();
+                    let offset = T::from_usize(offset).unwrap();
                     // This arguments means that we prune the next index way before here.
                     if i < offset {
                         // End of the list due to pruning
@@ -354,15 +385,15 @@ where
                 } else {
                     i
                 };
-                match_indices.push(match_row_idx.into());
+                match_indices.push(match_row_idx.to_u64().unwrap());
                 input_indices.push(row_idx as u32);
                 // Follow the chain to get the next index value
-                let next_chain = next[match_row_idx.into() as usize];
-                if next_chain == zero {
+                let next_chain = next[match_row_idx.to_u64().unwrap() as usize];
+                if next_chain.is_zero() {
                     // end of list
                     break;
                 }
-                i = next_chain - one;
+                i = next_chain - T::one();
             }
         }
     }
@@ -378,30 +409,49 @@ pub fn get_matched_indices_with_limit_offset<T>(
     offset: JoinHashMapOffset,
 ) -> (Vec<u32>, Vec<u64>, Option<JoinHashMapOffset>)
 where
-    T: Copy + TryFrom<usize> + PartialOrd + Into<u64> + Sub<Output = T>,
-    <T as TryFrom<usize>>::Error: Debug,
+    T: Copy + PartialOrd + Sub<Output = T> + Zero + One + ToPrimitive + FromPrimitive,
 {
+    // Pre-allocate with exact capacity and use spare_capacity_mut for safe direct writes
     let mut input_indices = Vec::with_capacity(limit);
     let mut match_indices = Vec::with_capacity(limit);
-    let zero = T::try_from(0).unwrap();
-    let one = T::try_from(1).unwrap();
+
+    let mut write_pos = 0;
 
     // Check if hashmap consists of unique values
     // If so, we can skip the chain traversal
     if map.len() == next_chain.len() {
         let start = offset.0;
         let end = (start + limit).min(hash_values.len());
-        for (i, &hash) in hash_values[start..end].iter().enumerate() {
-            if let Some((_, idx)) = map.find(hash, |(h, _)| hash == *h) {
-                input_indices.push(start as u32 + i as u32);
-                match_indices.push((*idx - one).into());
-            }
+
+        let x = hash_values[start..end]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &hash)| {
+                map.find(hash, |(h, _)| hash == *h).map(|(_, idx)| (i, idx))
+            })
+            .collect::<Vec<_>>();
+
+        // Use spare capacity for direct writes
+        let input_spare = input_indices.spare_capacity_mut();
+        let match_spare = match_indices.spare_capacity_mut();
+
+        for (i, idx) in x.into_iter() {
+            input_spare[write_pos].write(start as u32 + i as u32);
+            match_spare[write_pos].write((*idx - T::one()).to_u64().unwrap());
+            write_pos += 1;
         }
+
         let next_off = if end == hash_values.len() {
             None
         } else {
             Some((end, None))
         };
+
+        // Set the correct length before returning
+        unsafe {
+            input_indices.set_len(write_pos);
+            match_indices.set_len(write_pos);
+        }
         return (input_indices, match_indices, next_off);
     }
 
@@ -417,39 +467,61 @@ where
         // Otherwise, process remaining `initial_idx` matches by traversing `next_chain`,
         // to start with the next index
         (idx, Some(next_idx)) => {
-            let next_idx: T = T::try_from(next_idx as usize).unwrap();
-            chain_traverse!(
-                input_indices,
-                match_indices,
-                hash_values,
+            let next_idx: T = T::from_u64(next_idx).unwrap();
+            if let ChainTraverseResult::LimitReached(offset) = chain_traverse(
+                &mut input_indices,
+                &mut match_indices,
+                &mut write_pos,
                 next_chain,
+                hash_values.len(),
                 idx,
                 next_idx,
-                remaining_output,
-                one,
-                zero
-            );
+                &mut remaining_output,
+            ) {
+                // Set the correct length before returning
+                unsafe {
+                    input_indices.set_len(write_pos);
+                    match_indices.set_len(write_pos);
+                }
+                return (input_indices, match_indices, offset);
+            }
             idx + 1
         }
     };
 
-    let mut row_idx = to_skip;
-    for &hash in &hash_values[to_skip..] {
-        if let Some((_, idx)) = map.find(hash, |(h, _)| hash == *h) {
-            let idx: T = *idx;
-            chain_traverse!(
-                input_indices,
-                match_indices,
-                hash_values,
-                next_chain,
-                row_idx,
-                idx,
-                remaining_output,
-                one,
-                zero
-            );
+    let idxes = hash_values[to_skip..]
+        .iter()
+        .enumerate()
+        .filter_map(|(row_idx, &hash)| {
+            map.find(hash, |(h, _)| hash == *h)
+                .map(|(_, idx)| (row_idx + to_skip, *idx))
+        })
+        .collect::<Vec<_>>();
+
+    for (row_idx, idx) in idxes {
+        if let ChainTraverseResult::LimitReached(offset) = chain_traverse(
+            &mut input_indices,
+            &mut match_indices,
+            &mut write_pos,
+            next_chain,
+            hash_values.len(),
+            row_idx,
+            idx,
+            &mut remaining_output,
+        ) {
+            // Set the correct length before returning
+            unsafe {
+                input_indices.set_len(write_pos);
+                match_indices.set_len(write_pos);
+            }
+            return (input_indices, match_indices, offset);
         }
-        row_idx += 1;
+    }
+
+    // Set the correct length before final return
+    unsafe {
+        input_indices.set_len(write_pos);
+        match_indices.set_len(write_pos);
     }
     (input_indices, match_indices, None)
 }
