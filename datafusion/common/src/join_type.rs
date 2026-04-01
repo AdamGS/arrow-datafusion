@@ -61,9 +61,16 @@ pub enum JoinType {
     /// [1]. This join type is used to decorrelate EXISTS subqueries used inside disjunctive
     /// predicates.
     ///
-    /// Note: This we currently do not implement the full null semantics for the mark join described
-    /// in [1] which will be needed if we and ANY subqueries. In our version the mark column will
-    /// only be true for had a match and false when no match was found, never null.
+    /// When the join's `null_aware` flag is false (the default), the mark column is non-nullable
+    /// and only contains true/false. When `null_aware` is true, the mark column is nullable and
+    /// uses three-valued logic as described in [1] Section 5.6:
+    /// - true: at least one join partner where the comparison evaluates to true
+    /// - false: no join partner at all (or the right/probe side is empty)
+    /// - null: at least one join partner where the comparison evaluates to null,
+    ///   but none where it evaluates to true
+    ///
+    /// Null-aware mark joins are needed for correct NOT IN semantics inside
+    /// disjunctive (OR) predicates and for ANY subqueries.
     ///
     /// [1]: http://btw2017.informatik.uni-stuttgart.de/slidesandpapers/F1-10-37/paper_web.pdf
     LeftMark,

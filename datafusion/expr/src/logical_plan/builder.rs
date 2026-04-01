@@ -1130,8 +1130,14 @@ impl LogicalPlanBuilder {
             .zip(right_keys)
             .map(|(l, r)| (Expr::Column(l), Expr::Column(r)))
             .collect();
-        let join_schema =
-            build_join_schema(self.plan.schema(), right.schema(), &join_type)?;
+        let nullable_mark =
+            null_aware && matches!(join_type, JoinType::LeftMark | JoinType::RightMark);
+        let join_schema = build_join_schema(
+            self.plan.schema(),
+            right.schema(),
+            &join_type,
+            nullable_mark,
+        )?;
 
         // Inner type without join condition is cross join
         if join_type != JoinType::Inner && on.is_empty() && filter.is_none() {
@@ -1624,7 +1630,7 @@ pub fn unique_field_aliases(fields: &Fields) -> Vec<Option<String>> {
         .collect()
 }
 
-fn mark_field(schema: &DFSchema) -> (Option<TableReference>, Arc<Field>) {
+fn mark_field(schema: &DFSchema, nullable: bool) -> (Option<TableReference>, Arc<Field>) {
     let mut table_references = schema
         .iter()
         .filter_map(|(qualifier, _)| qualifier)
@@ -1638,16 +1644,21 @@ fn mark_field(schema: &DFSchema) -> (Option<TableReference>, Arc<Field>) {
 
     (
         table_reference,
-        Arc::new(Field::new("mark", DataType::Boolean, false)),
+        Arc::new(Field::new("mark", DataType::Boolean, nullable)),
     )
 }
 
 /// Creates a schema for a join operation.
-/// The fields from the left side are first
+/// The fields from the left side are first.
+///
+/// `nullable_mark` controls whether the mark column (for LeftMark/RightMark joins) is nullable.
+/// When `true`, the mark column supports three-valued logic (true/false/null) needed for
+/// null-aware mark joins.
 pub fn build_join_schema(
     left: &DFSchema,
     right: &DFSchema,
     join_type: &JoinType,
+    nullable_mark: bool,
 ) -> Result<DFSchema> {
     fn nullify_fields<'a>(
         fields: impl Iterator<Item = (Option<&'a TableReference>, &'a Arc<Field>)>,
@@ -1710,7 +1721,7 @@ pub fn build_join_schema(
         }
         JoinType::LeftMark => left_fields
             .map(|(q, f)| (q.cloned(), Arc::clone(f)))
-            .chain(once(mark_field(right)))
+            .chain(once(mark_field(right, nullable_mark)))
             .collect(),
         JoinType::RightSemi | JoinType::RightAnti => {
             // Only use the right side for the schema
@@ -1720,7 +1731,7 @@ pub fn build_join_schema(
         }
         JoinType::RightMark => right_fields
             .map(|(q, f)| (q.cloned(), Arc::clone(f)))
-            .chain(once(mark_field(left)))
+            .chain(once(mark_field(left, nullable_mark)))
             .collect(),
     };
     let func_dependencies = left.functional_dependencies().join(
@@ -2875,13 +2886,13 @@ mod tests {
         )?;
 
         let join_schema =
-            build_join_schema(&left_schema, &right_schema, &JoinType::Left)?;
+            build_join_schema(&left_schema, &right_schema, &JoinType::Left, false)?;
         assert_eq!(
             join_schema.metadata(),
             &HashMap::from([("key".to_string(), "left".to_string())])
         );
         let join_schema =
-            build_join_schema(&left_schema, &right_schema, &JoinType::Right)?;
+            build_join_schema(&left_schema, &right_schema, &JoinType::Right, false)?;
         assert_eq!(
             join_schema.metadata(),
             &HashMap::from([("key".to_string(), "right".to_string())])

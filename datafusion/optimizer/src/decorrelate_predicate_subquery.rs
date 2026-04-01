@@ -440,9 +440,24 @@ fn build_join(
             sub_query_alias.clone()
         };
 
-        // Mark joins don't use null-aware semantics (they use three-valued logic with mark column)
+        // Use null-aware mark join for IN/NOT IN subqueries when join keys may
+        // contain NULLs. EXISTS/NOT EXISTS uses two-valued logic (no null awareness
+        // needed). This mirrors the same distinction made for anti joins below.
+        let null_aware = in_predicate_opt.is_some()
+            && join_keys_may_be_null(
+                &join_filter,
+                left.schema(),
+                right_projected.schema(),
+            )?;
         let new_plan = LogicalPlanBuilder::from(left.clone())
-            .join_on(right_projected, join_type, Some(join_filter))?
+            .join_detailed_with_options(
+                right_projected,
+                join_type,
+                (Vec::<Column>::new(), Vec::<Column>::new()),
+                Some(join_filter),
+                NullEquality::NullEqualsNothing,
+                null_aware,
+            )?
             .build()?;
 
         debug!(

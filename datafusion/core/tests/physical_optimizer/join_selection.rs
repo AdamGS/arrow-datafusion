@@ -420,6 +420,61 @@ async fn test_join_with_swap_mark() {
     }
 }
 
+#[tokio::test]
+async fn test_null_aware_join_with_swap_mark() {
+    let join_types = [JoinType::LeftMark, JoinType::RightMark];
+    for join_type in join_types {
+        let (big, small) = create_big_and_small();
+
+        let join = HashJoinExec::try_new(
+            Arc::clone(&big),
+            Arc::clone(&small),
+            vec![(
+                Arc::new(Column::new_with_schema("big_col", &big.schema()).unwrap()),
+                Arc::new(Column::new_with_schema("small_col", &small.schema()).unwrap()),
+            )],
+            None,
+            &join_type,
+            None,
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing,
+            true,
+        )
+        .unwrap();
+
+        let original_schema = join.schema();
+
+        let optimized_join = JoinSelection::new()
+            .optimize(Arc::new(join), &ConfigOptions::new())
+            .unwrap();
+
+        let swapped_join = optimized_join
+            .as_any()
+            .downcast_ref::<HashJoinExec>()
+            .expect("The type of the plan should not be changed");
+
+        assert_eq!(*swapped_join.partition_mode(), PartitionMode::CollectLeft);
+        assert_eq!(swapped_join.schema().fields().len(), 2);
+        assert_eq!(
+            swapped_join
+                .left()
+                .partition_statistics(None)
+                .unwrap()
+                .total_byte_size,
+            Precision::Inexact(8192)
+        );
+        assert_eq!(
+            swapped_join
+                .right()
+                .partition_statistics(None)
+                .unwrap()
+                .total_byte_size,
+            Precision::Inexact(2097152)
+        );
+        assert_eq!(original_schema, swapped_join.schema());
+    }
+}
+
 /// Compare the input plan with the plan after running the probe order optimizer.
 macro_rules! assert_optimized {
     ($PLAN: expr, @$EXPECTED_LINES: literal $(,)?) => {

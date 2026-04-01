@@ -33,7 +33,7 @@ use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };
 use crate::joins::utils::{
-    OnceFut, equal_rows_arr, get_final_indices_from_shared_bitmap,
+    OnceFut, eq_dyn_null, equal_rows_arr, get_final_indices_from_shared_bitmap,
 };
 use crate::{
     RecordBatchStream, SendableRecordBatchStream, handle_state,
@@ -46,15 +46,20 @@ use crate::{
     },
 };
 
-use arrow::array::{Array, ArrayRef, UInt32Array, UInt64Array};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, BooleanBufferBuilder, BooleanBuilder, UInt32Array,
+    UInt64Array,
+};
+use arrow::compute::kernels::boolean::and_kleene;
+use arrow::compute::take;
 use arrow::datatypes::{Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use datafusion_common::cast::as_boolean_array;
+use datafusion_common::hash_utils::RandomState;
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, internal_datafusion_err, internal_err,
 };
 use datafusion_physical_expr::PhysicalExprRef;
-
-use datafusion_common::hash_utils::RandomState;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use futures::{Stream, StreamExt, ready};
 
@@ -614,52 +619,104 @@ impl HashJoinStream {
     fn process_probe_batch(
         &mut self,
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
-        let state = self.state.try_as_process_probe_batch_mut()?;
-        let build_side = self.build_side.try_as_ready_mut()?;
+        let probe_batch_size = {
+            let state = self.state.try_as_process_probe_batch_mut()?;
+            state.batch.num_rows()
+        };
 
-        self.join_metrics
-            .probe_hit_rate
-            .add_total(state.batch.num_rows());
+        self.join_metrics.probe_hit_rate.add_total(probe_batch_size);
 
         let timer = self.join_metrics.join_time.timer();
 
-        // Null-aware anti join semantics:
-        // For LeftAnti: output LEFT (build) rows where LEFT.key NOT IN RIGHT.key
-        // 1. If RIGHT (probe) contains NULL in any batch, no LEFT rows should be output
-        // 2. LEFT rows with NULL keys should not be output (handled in final stage)
-        if self.null_aware {
-            // Mark that we've seen a probe batch with actual rows (probe side is non-empty)
-            // Only set this if batch has rows - empty batches don't count
-            // Use shared atomic state so all partitions can see this global information
-            if state.batch.num_rows() > 0 {
-                build_side
-                    .left_data
-                    .probe_side_non_empty
-                    .store(true, Ordering::Relaxed);
-            }
+        let mut null_aware_mark_input = None;
 
-            // Check if probe side (RIGHT) contains NULL
-            // Since null_aware validation ensures single column join, we only check the first column
-            let probe_key_column = &state.values[0];
-            if probe_key_column.null_count() > 0 {
-                // Found NULL in probe side - set shared flag to prevent any output
-                build_side
-                    .left_data
-                    .probe_side_has_null
-                    .store(true, Ordering::Relaxed);
-            }
+        {
+            let state = self.state.try_as_process_probe_batch_mut()?;
+            let build_side = self.build_side.try_as_ready_mut()?;
 
-            // If probe side has NULL (detected in this or any other partition), return empty result
-            if build_side
-                .left_data
-                .probe_side_has_null
-                .load(Ordering::Relaxed)
-            {
-                timer.done();
-                self.state = HashJoinStreamState::FetchProbeBatch;
-                return Ok(StatefulStreamResult::Continue);
+            // Null-aware join semantics (anti join and mark join):
+            // Track whether the probe (RIGHT) side has NULL keys and whether it is non-empty.
+            if self.null_aware {
+                // Mark that we've seen a probe batch with actual rows (probe side is non-empty)
+                // Only set this if batch has rows - empty batches don't count
+                // Use shared atomic state so all partitions can see this global information
+                if state.batch.num_rows() > 0 {
+                    build_side
+                        .left_data
+                        .probe_side_non_empty
+                        .store(true, Ordering::Relaxed);
+                }
+
+                // Check if probe side (RIGHT) contains NULL in any join key column
+                for probe_key_column in &state.values {
+                    if probe_key_column.null_count() > 0 {
+                        build_side
+                            .left_data
+                            .probe_side_has_null
+                            .store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+
+                // For null-aware anti join: if probe side has NULL, no rows should be output,
+                // so we can skip the rest of the probe entirely.
+                if self.join_type == JoinType::LeftAnti
+                    && build_side
+                        .left_data
+                        .probe_side_has_null
+                        .load(Ordering::Relaxed)
+                {
+                    timer.done();
+                    self.state = HashJoinStreamState::FetchProbeBatch;
+                    return Ok(StatefulStreamResult::Continue);
+                }
+
+                // Null-aware mark joins must evaluate the full predicate directly so
+                // FALSE/NULL/TRUE are derived from the actual comparison result.
+                if matches!(self.join_type, JoinType::LeftMark | JoinType::RightMark) {
+                    null_aware_mark_input = Some((
+                        Arc::clone(&build_side.left_data),
+                        state.batch.clone(),
+                        state.values.clone(),
+                    ));
+                }
             }
         }
+
+        if let Some((left_data, probe_batch, probe_values)) = null_aware_mark_input {
+            let push_status = match self.join_type {
+                JoinType::LeftMark => {
+                    self.update_null_aware_left_mark_state(
+                        &left_data,
+                        &probe_batch,
+                        &probe_values,
+                    )?;
+                    None
+                }
+                JoinType::RightMark => Some(self.output_buffer.push_batch(
+                    self.build_null_aware_right_mark_batch(
+                        &left_data,
+                        &probe_batch,
+                        &probe_values,
+                    )?,
+                )?),
+                _ => unreachable!(),
+            };
+
+            timer.done();
+
+            if push_status == Some(PushBatchStatus::LimitReached) {
+                self.output_buffer.finish()?;
+                self.state = HashJoinStreamState::Completed;
+                return Ok(StatefulStreamResult::Continue);
+            }
+
+            self.state = HashJoinStreamState::FetchProbeBatch;
+            return Ok(StatefulStreamResult::Continue);
+        }
+
+        let state = self.state.try_as_process_probe_batch_mut()?;
+        let build_side = self.build_side.try_as_ready_mut()?;
 
         // If the build side is empty, this stream only reaches ProcessProbeBatch for
         // join types whose output still depends on probe rows.
@@ -846,9 +903,10 @@ impl HashJoinStream {
 
         let build_side = self.build_side.try_as_ready()?;
 
-        // For null-aware anti join, if probe side had NULL, no rows should be output
-        // Check shared atomic state to get global knowledge across all partitions
+        // For null-aware anti join, if probe side had NULL, no rows should be output.
+        // (For null-aware mark joins, we continue and handle NULLs in the mark column below.)
         if self.null_aware
+            && self.join_type == JoinType::LeftAnti
             && build_side
                 .left_data
                 .probe_side_has_null
@@ -860,6 +918,26 @@ impl HashJoinStream {
         }
         if !build_side.left_data.report_probe_completed() {
             self.state = HashJoinStreamState::Completed;
+            return Ok(StatefulStreamResult::Continue);
+        }
+
+        if self.null_aware && self.join_type == JoinType::LeftMark {
+            self.join_metrics.input_batches.add(1);
+            self.join_metrics
+                .input_rows
+                .add(build_side.left_data.batch().num_rows());
+
+            timer.done();
+            self.state = HashJoinStreamState::Completed;
+
+            let push_status = self.output_buffer.push_batch(
+                self.build_null_aware_left_mark_batch(&build_side.left_data)?,
+            )?;
+
+            if push_status == PushBatchStatus::LimitReached {
+                self.output_buffer.finish()?;
+            }
+
             return Ok(StatefulStreamResult::Continue);
         }
 
@@ -935,6 +1013,248 @@ impl HashJoinStream {
 
         Ok(StatefulStreamResult::Continue)
     }
+    fn update_null_aware_left_mark_state(
+        &self,
+        left_data: &JoinLeftData,
+        probe_batch: &RecordBatch,
+        probe_values: &[ArrayRef],
+    ) -> Result<()> {
+        if left_data.batch().num_rows() == 0 || probe_batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let mut visited_bitmap = left_data.visited_indices_bitmap().lock();
+        let mut null_bitmap = left_data
+            .null_markers_bitmap()
+            .ok_or_else(|| {
+                internal_datafusion_err!("null-aware left mark bitmap missing")
+            })?
+            .lock();
+
+        for probe_row_idx in 0..probe_batch.num_rows() {
+            let predicate = evaluate_null_aware_mark_predicate_for_right_row(
+                left_data,
+                probe_batch,
+                probe_values,
+                probe_row_idx,
+                self.filter.as_ref(),
+                self.null_equality,
+            )?;
+            update_null_aware_mark_bitmaps(
+                &predicate,
+                &mut visited_bitmap,
+                &mut null_bitmap,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn build_null_aware_right_mark_batch(
+        &self,
+        left_data: &JoinLeftData,
+        probe_batch: &RecordBatch,
+        probe_values: &[ArrayRef],
+    ) -> Result<RecordBatch> {
+        let mut mark_builder = BooleanBuilder::with_capacity(probe_batch.num_rows());
+
+        for probe_row_idx in 0..probe_batch.num_rows() {
+            let predicate = evaluate_null_aware_mark_predicate_for_right_row(
+                left_data,
+                probe_batch,
+                probe_values,
+                probe_row_idx,
+                self.filter.as_ref(),
+                self.null_equality,
+            )?;
+            append_null_aware_mark(&mut mark_builder, null_aware_mark_state(&predicate));
+        }
+
+        build_mark_join_batch(
+            &self.schema,
+            probe_batch,
+            &self.column_indices,
+            JoinSide::Right,
+            Arc::new(mark_builder.finish()),
+        )
+    }
+
+    fn build_null_aware_left_mark_batch(
+        &self,
+        left_data: &JoinLeftData,
+    ) -> Result<RecordBatch> {
+        let visited_bitmap = left_data.visited_indices_bitmap().lock();
+        let null_bitmap = left_data
+            .null_markers_bitmap()
+            .ok_or_else(|| {
+                internal_datafusion_err!("null-aware left mark bitmap missing")
+            })?
+            .lock();
+
+        let mut mark_builder =
+            BooleanBuilder::with_capacity(left_data.batch().num_rows());
+        for left_row_idx in 0..left_data.batch().num_rows() {
+            if visited_bitmap.get_bit(left_row_idx) {
+                mark_builder.append_value(true);
+            } else if null_bitmap.get_bit(left_row_idx) {
+                mark_builder.append_null();
+            } else {
+                mark_builder.append_value(false);
+            }
+        }
+
+        build_mark_join_batch(
+            &self.schema,
+            left_data.batch(),
+            &self.column_indices,
+            JoinSide::Left,
+            Arc::new(mark_builder.finish()),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NullAwareMarkState {
+    False,
+    Null,
+    True,
+}
+
+fn null_aware_mark_state(predicate: &BooleanArray) -> NullAwareMarkState {
+    let mut saw_null = false;
+
+    for idx in 0..predicate.len() {
+        if predicate.is_null(idx) {
+            saw_null = true;
+        } else if predicate.value(idx) {
+            return NullAwareMarkState::True;
+        }
+    }
+
+    if saw_null {
+        NullAwareMarkState::Null
+    } else {
+        NullAwareMarkState::False
+    }
+}
+
+fn append_null_aware_mark(mark_builder: &mut BooleanBuilder, state: NullAwareMarkState) {
+    match state {
+        NullAwareMarkState::True => mark_builder.append_value(true),
+        NullAwareMarkState::False => mark_builder.append_value(false),
+        NullAwareMarkState::Null => mark_builder.append_null(),
+    }
+}
+
+fn update_null_aware_mark_bitmaps(
+    predicate: &BooleanArray,
+    visited_bitmap: &mut BooleanBufferBuilder,
+    null_bitmap: &mut BooleanBufferBuilder,
+) {
+    for left_row_idx in 0..predicate.len() {
+        if predicate.is_null(left_row_idx) {
+            null_bitmap.set_bit(left_row_idx, true);
+        } else if predicate.value(left_row_idx) {
+            visited_bitmap.set_bit(left_row_idx, true);
+        }
+    }
+}
+
+fn evaluate_null_aware_mark_predicate_for_right_row(
+    left_data: &JoinLeftData,
+    probe_batch: &RecordBatch,
+    probe_values: &[ArrayRef],
+    probe_row_idx: usize,
+    filter: Option<&JoinFilter>,
+    null_equality: NullEquality,
+) -> Result<BooleanArray> {
+    let left_row_count = left_data.batch().num_rows();
+    if left_row_count == 0 {
+        return Ok(BooleanBuilder::with_capacity(0).finish());
+    }
+
+    let left_indices = UInt64Array::from_iter_values(0..left_row_count as u64);
+    let repeated_probe_indices =
+        UInt32Array::from(vec![probe_row_idx as u32; left_row_count]);
+
+    let mut predicate = None;
+
+    for (left_key, probe_key) in left_data.values().iter().zip(probe_values.iter()) {
+        let repeated_probe_key = take(probe_key.as_ref(), &repeated_probe_indices, None)?;
+        let equality = eq_dyn_null(
+            left_key.as_ref(),
+            repeated_probe_key.as_ref(),
+            null_equality,
+        )?;
+        predicate = Some(match predicate {
+            Some(current) => and_kleene(&current, &equality)?,
+            None => equality,
+        });
+    }
+
+    if let Some(filter) = filter {
+        let filter_batch = build_batch_from_indices(
+            filter.schema(),
+            left_data.batch(),
+            probe_batch,
+            &left_indices,
+            &repeated_probe_indices,
+            filter.column_indices(),
+            JoinSide::Left,
+            JoinType::Inner,
+        )?;
+
+        let filter_result = filter
+            .expression()
+            .evaluate(&filter_batch)?
+            .into_array(filter_batch.num_rows())?;
+        let filter_result = as_boolean_array(&filter_result)?.clone();
+
+        predicate = Some(match predicate {
+            Some(current) => and_kleene(&current, &filter_result)?,
+            None => filter_result,
+        });
+    }
+
+    predicate.ok_or_else(|| {
+        internal_datafusion_err!(
+            "null-aware mark join requires at least one equality key or filter"
+        )
+    })
+}
+
+fn build_mark_join_batch(
+    schema: &SchemaRef,
+    batch: &RecordBatch,
+    column_indices: &[ColumnIndex],
+    batch_side: JoinSide,
+    mark: ArrayRef,
+) -> Result<RecordBatch> {
+    if schema.fields().is_empty() {
+        let options = RecordBatchOptions::new().with_row_count(Some(mark.len()));
+        return Ok(RecordBatch::try_new_with_options(
+            Arc::clone(schema),
+            vec![],
+            &options,
+        )?);
+    }
+
+    let mut columns = Vec::with_capacity(column_indices.len());
+    for column_index in column_indices {
+        match column_index.side {
+            JoinSide::None => columns.push(Arc::clone(&mark)),
+            side if side == batch_side => {
+                columns.push(Arc::clone(batch.column(column_index.index)));
+            }
+            side => {
+                return internal_err!(
+                    "Unexpected column side {side:?} for mark join batch"
+                );
+            }
+        }
+    }
+
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
 impl Stream for HashJoinStream {

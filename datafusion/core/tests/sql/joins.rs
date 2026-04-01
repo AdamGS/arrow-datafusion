@@ -299,3 +299,73 @@ async fn unparse_cross_join() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn null_aware_not_in_mark_uses_hash_join_when_hash_join_not_preferred() -> Result<()>
+{
+    let config = SessionConfig::new()
+        .with_target_partitions(2)
+        .set_bool("datafusion.optimizer.prefer_hash_join", false)
+        .set_bool("datafusion.optimizer.repartition_joins", true);
+    let ctx = SessionContext::new_with_config(config);
+
+    let outer_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("grp", DataType::Int32, true),
+    ]));
+    let outer_batch = RecordBatch::try_new(
+        Arc::clone(&outer_schema),
+        vec![
+            Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+            Arc::new(Int32Array::from(vec![Some(10), Some(20)])),
+        ],
+    )?;
+    ctx.register_table(
+        "outer_tbl",
+        Arc::new(MemTable::try_new(outer_schema, vec![vec![outer_batch]])?),
+    )?;
+
+    let inner_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("grp", DataType::Int32, true),
+    ]));
+    let inner_batch = RecordBatch::try_new(
+        Arc::clone(&inner_schema),
+        vec![
+            Arc::new(Int32Array::from(vec![None])),
+            Arc::new(Int32Array::from(vec![Some(10)])),
+        ],
+    )?;
+    ctx.register_table(
+        "inner_tbl",
+        Arc::new(MemTable::try_new(inner_schema, vec![vec![inner_batch]])?),
+    )?;
+
+    let sql = r#"
+        SELECT id
+        FROM outer_tbl o
+        WHERE o.id = 99
+           OR o.id NOT IN (
+               SELECT i.id
+               FROM inner_tbl i
+               WHERE i.grp = o.grp
+           )
+        ORDER BY id
+    "#;
+    let dataframe = ctx.sql(sql).await?;
+
+    let physical_plan = dataframe.clone().create_physical_plan().await?;
+    let formatted = displayable(physical_plan.as_ref()).indent(true).to_string();
+    assert!(
+        formatted.contains("HashJoinExec"),
+        "expected HashJoinExec in physical plan, got:\n{formatted}"
+    );
+
+    let batches = dataframe.collect().await?;
+    assert_batches_eq!(
+        ["+----+", "| id |", "+----+", "| 2  |", "+----+",],
+        &batches
+    );
+
+    Ok(())
+}

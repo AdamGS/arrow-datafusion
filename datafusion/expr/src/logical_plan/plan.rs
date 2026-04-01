@@ -663,8 +663,14 @@ impl LogicalPlan {
                 null_equality,
                 null_aware,
             }) => {
-                let schema =
-                    build_join_schema(left.schema(), right.schema(), &join_type)?;
+                let nullable_mark = null_aware
+                    && matches!(join_type, JoinType::LeftMark | JoinType::RightMark);
+                let schema = build_join_schema(
+                    left.schema(),
+                    right.schema(),
+                    &join_type,
+                    nullable_mark,
+                )?;
 
                 let new_on: Vec<_> = on
                     .into_iter()
@@ -907,7 +913,14 @@ impl LogicalPlan {
                 ..
             }) => {
                 let (left, right) = self.only_two_inputs(inputs)?;
-                let schema = build_join_schema(left.schema(), right.schema(), join_type)?;
+                let nullable_mark = *null_aware
+                    && matches!(join_type, JoinType::LeftMark | JoinType::RightMark);
+                let schema = build_join_schema(
+                    left.schema(),
+                    right.schema(),
+                    join_type,
+                    nullable_mark,
+                )?;
 
                 let equi_expr_count = on.len() * 2;
                 assert!(expr.len() >= equi_expr_count);
@@ -3868,7 +3881,8 @@ pub struct Join {
     pub null_equality: NullEquality,
     /// Whether this is a null-aware anti join (for NOT IN semantics).
     ///
-    /// Only applies to LeftAnti joins. When true, implements SQL NOT IN semantics where:
+    /// Only applies to LeftAnti joins and Left/Right Mark joins. When true,
+    /// implements SQL NOT IN semantics where:
     /// - If the right side (subquery) contains any NULL in join keys, no rows are output
     /// - Left side rows with NULL in join keys are not output
     ///
@@ -3907,7 +3921,10 @@ impl Join {
         null_equality: NullEquality,
         null_aware: bool,
     ) -> Result<Self> {
-        let join_schema = build_join_schema(left.schema(), right.schema(), &join_type)?;
+        let nullable_mark =
+            null_aware && matches!(join_type, JoinType::LeftMark | JoinType::RightMark);
+        let join_schema =
+            build_join_schema(left.schema(), right.schema(), &join_type, nullable_mark)?;
 
         Ok(Join {
             left,
@@ -3958,10 +3975,16 @@ impl Join {
             .map(|(l, r)| (Expr::Column(l), Expr::Column(r)))
             .collect();
 
+        let nullable_mark = original_join.null_aware
+            && matches!(
+                original_join.join_type,
+                JoinType::LeftMark | JoinType::RightMark
+            );
         let join_schema = build_join_schema(
             left_sch.schema(),
             right_sch.schema(),
             &original_join.join_type,
+            nullable_mark,
         )?;
 
         Ok((

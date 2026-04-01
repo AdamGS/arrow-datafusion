@@ -59,7 +59,7 @@ use crate::{
     common::can_project,
     joins::utils::{
         BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinHashMapType,
-        build_join_schema, check_join_is_valid, estimate_join_statistics,
+        build_join_schema_nullable_mark, check_join_is_valid, estimate_join_statistics,
         need_produce_result_in_final, symmetric_join_output_partitioning,
     },
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
@@ -197,6 +197,9 @@ pub(super) struct JoinLeftData {
     values: Vec<ArrayRef>,
     /// Shared bitmap builder for visited left indices
     visited_indices_bitmap: SharedBitmapBuilder,
+    /// Shared bitmap builder for rows whose null-aware marker saw at least one
+    /// NULL comparison. Used only for null-aware left mark joins.
+    null_markers_bitmap: Option<SharedBitmapBuilder>,
     /// Counter of running probe-threads, potentially
     /// able to update `visited_indices_bitmap`
     probe_threads_counter: AtomicUsize,
@@ -238,6 +241,11 @@ impl JoinLeftData {
     /// returns a reference to the visited indices bitmap
     pub(super) fn visited_indices_bitmap(&self) -> &SharedBitmapBuilder {
         &self.visited_indices_bitmap
+    }
+
+    /// returns a reference to the null marker bitmap, if present
+    pub(super) fn null_markers_bitmap(&self) -> Option<&SharedBitmapBuilder> {
+        self.null_markers_bitmap.as_ref()
     }
 
     /// returns a reference to the InList values for filter pushdown
@@ -405,17 +413,22 @@ impl HashJoinExecBuilder {
         // Validate null_aware flag
         if exec.null_aware {
             let join_type = exec.join_type();
-            if !matches!(join_type, JoinType::LeftAnti) {
+            if !matches!(
+                join_type,
+                JoinType::LeftAnti | JoinType::LeftMark | JoinType::RightMark
+            ) {
                 return plan_err!(
-                    "null_aware can only be true for LeftAnti joins, got {join_type}"
+                    "null_aware can only be true for LeftAnti/LeftMark/RightMark joins, got {join_type}"
                 );
             }
-            let on = exec.on();
-            if on.len() != 1 {
-                return plan_err!(
-                    "null_aware anti join only supports single column join key, got {} columns",
-                    on.len()
-                );
+            if matches!(join_type, JoinType::LeftAnti) {
+                let on = exec.on();
+                if on.len() != 1 {
+                    return plan_err!(
+                        "null_aware anti join only supports single column join key, got {} columns",
+                        on.len()
+                    );
+                }
             }
         }
 
@@ -451,8 +464,14 @@ impl HashJoinExecBuilder {
         }
 
         check_join_is_valid(&left_schema, &right_schema, &on)?;
-        let (join_schema, column_indices) =
-            build_join_schema(&left_schema, &right_schema, &join_type);
+        let nullable_mark =
+            null_aware && matches!(join_type, JoinType::LeftMark | JoinType::RightMark);
+        let (join_schema, column_indices) = build_join_schema_nullable_mark(
+            &left_schema,
+            &right_schema,
+            &join_type,
+            nullable_mark,
+        );
 
         let join_schema = Arc::new(join_schema);
 
@@ -1330,6 +1349,7 @@ impl ExecutionPlan for HashJoinExec {
                     join_metrics.clone(),
                     reservation,
                     need_produce_result_in_final(self.join_type),
+                    self.null_aware && self.join_type == JoinType::LeftMark,
                     self.right().output_partitioning().partition_count(),
                     enable_dynamic_filter_pushdown,
                     Arc::clone(context.session_config().options()),
@@ -1351,6 +1371,7 @@ impl ExecutionPlan for HashJoinExec {
                     join_metrics.clone(),
                     reservation,
                     need_produce_result_in_final(self.join_type),
+                    self.null_aware && self.join_type == JoinType::LeftMark,
                     1,
                     enable_dynamic_filter_pushdown,
                     Arc::clone(context.session_config().options()),
@@ -1897,6 +1918,7 @@ async fn collect_left_input(
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
     with_visited_indices_bitmap: bool,
+    with_null_markers_bitmap: bool,
     probe_threads_count: usize,
     should_compute_dynamic_filters: bool,
     config: Arc<ConfigOptions>,
@@ -2043,6 +2065,18 @@ async fn collect_left_input(
         BooleanBufferBuilder::new(0)
     };
 
+    let null_markers_bitmap = if with_null_markers_bitmap {
+        let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
+        reservation.try_grow(bitmap_size)?;
+        metrics.build_mem_used.add(bitmap_size);
+
+        let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
+        bitmap_buffer.append_n(num_rows, false);
+        Some(Mutex::new(bitmap_buffer))
+    } else {
+        None
+    };
+
     let map = Arc::new(join_hash_map);
 
     let membership = if num_rows == 0 {
@@ -2080,6 +2114,7 @@ async fn collect_left_input(
         batch,
         values: left_values,
         visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+        null_markers_bitmap,
         probe_threads_counter: AtomicUsize::new(probe_threads_count),
         _reservation: reservation,
         bounds,
@@ -2374,6 +2409,27 @@ mod tests {
         Ok((join, dynamic_filter))
     }
 
+    fn null_aware_join(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        on: JoinOn,
+        filter: Option<JoinFilter>,
+        join_type: &JoinType,
+        null_equality: NullEquality,
+    ) -> Result<HashJoinExec> {
+        HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            filter,
+            join_type,
+            None,
+            PartitionMode::CollectLeft,
+            null_equality,
+            true,
+        )
+    }
+
     async fn join_collect(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
@@ -2410,6 +2466,39 @@ mod tests {
             context,
         )
         .await
+    }
+
+    fn nullable_gt_filter(
+        left_name: &str,
+        left_index: usize,
+        right_name: &str,
+        right_index: usize,
+    ) -> JoinFilter {
+        let column_indices = vec![
+            ColumnIndex {
+                index: left_index,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: right_index,
+                side: JoinSide::Right,
+            },
+        ];
+        let intermediate_schema = Schema::new(vec![
+            Field::new(left_name, DataType::Int32, true),
+            Field::new(right_name, DataType::Int32, true),
+        ]);
+        let filter_expression = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new(right_name, 1)),
+            Operator::Gt,
+            Arc::new(Column::new(left_name, 0)),
+        )) as Arc<dyn PhysicalExpr>;
+
+        JoinFilter::new(
+            filter_expression,
+            column_indices,
+            Arc::new(intermediate_schema),
+        )
     }
 
     async fn join_collect_with_partition_mode(
@@ -6058,6 +6147,152 @@ mod tests {
         Ok(())
     }
 
+    /// Test null-aware mark join when the residual filter is NULL.
+    /// Expected: unmatched FALSE is promoted to NULL only for the affected row.
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_left_mark_filter_null_yields_null(
+        batch_size: usize,
+        _use_perfect_hash_join_as_possible: bool,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_two_cols(
+            ("k", &vec![Some(1), Some(2), Some(3)]),
+            ("b", &vec![Some(10), Some(10), Some(10)]),
+        );
+        let right = build_table_two_cols(
+            ("k", &vec![Some(1), Some(2), Some(3)]),
+            ("z", &vec![Some(20), Some(5), None]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("k", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("k", &right.schema())?) as _,
+        )];
+        let filter = nullable_gt_filter("b", 1, "z", 1);
+
+        let join = null_aware_join(
+            left,
+            right,
+            on,
+            Some(filter),
+            &JoinType::LeftMark,
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +---+----+-------+
+            | k | b  | mark  |
+            +---+----+-------+
+            | 1 | 10 | true  |
+            | 2 | 10 | false |
+            | 3 | 10 |       |
+            +---+----+-------+
+            ");
+        }
+        Ok(())
+    }
+
+    /// Test null-aware mark join when a probe row has NULL in the join key but the
+    /// residual filter rejects that row. Expected: unmatched rows stay FALSE.
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_left_mark_probe_null_with_false_residual_stays_false(
+        batch_size: usize,
+        _use_perfect_hash_join_as_possible: bool,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_two_cols(
+            ("k", &vec![Some(1), Some(2)]),
+            ("b", &vec![Some(10), Some(10)]),
+        );
+        let right = build_table_two_cols(
+            ("k", &vec![Some(1), Some(2), None]),
+            ("z", &vec![Some(20), Some(5), Some(0)]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("k", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("k", &right.schema())?) as _,
+        )];
+        let filter = nullable_gt_filter("b", 1, "z", 1);
+
+        let join = null_aware_join(
+            left,
+            right,
+            on,
+            Some(filter),
+            &JoinType::LeftMark,
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +---+----+-------+
+            | k | b  | mark  |
+            +---+----+-------+
+            | 1 | 10 | true  |
+            | 2 | 10 | false |
+            +---+----+-------+
+            ");
+        }
+        Ok(())
+    }
+
+    /// Test null-aware mark join with two extracted equality keys.
+    /// Expected: FALSE remains FALSE when another key already rejects the partner.
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_left_mark_multi_key_false_stays_false(
+        batch_size: usize,
+        _use_perfect_hash_join_as_possible: bool,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_two_cols(("k1", &vec![Some(1)]), ("k2", &vec![Some(10)]));
+        let right = build_table_two_cols(("k1", &vec![Some(2)]), ("k2", &vec![None]));
+        let on = vec![
+            (
+                Arc::new(Column::new_with_schema("k1", &left.schema())?) as _,
+                Arc::new(Column::new_with_schema("k1", &right.schema())?) as _,
+            ),
+            (
+                Arc::new(Column::new_with_schema("k2", &left.schema())?) as _,
+                Arc::new(Column::new_with_schema("k2", &right.schema())?) as _,
+            ),
+        ];
+
+        let join = null_aware_join(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::LeftMark,
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+----+-------+
+            | k1 | k2 | mark  |
+            +----+----+-------+
+            | 1  | 10 | false |
+            +----+----+-------+
+            ");
+        }
+        Ok(())
+    }
+
     /// Test that null_aware validation rejects non-LeftAnti join types
     #[tokio::test]
     async fn test_null_aware_validation_wrong_join_type() {
@@ -6085,12 +6320,9 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("null_aware can only be true for LeftAnti joins")
-        );
+        assert!(result.unwrap_err().to_string().contains(
+            "null_aware can only be true for LeftAnti/LeftMark/RightMark joins"
+        ));
     }
 
     /// Test that null_aware validation rejects multi-column joins
@@ -6131,6 +6363,49 @@ mod tests {
                 .to_string()
                 .contains("null_aware anti join only supports single column join key")
         );
+    }
+
+    /// Test null-aware right mark join when the build side contains a NULL key.
+    /// Expected: unmatched FALSE is promoted to NULL for the probe row.
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_right_mark_build_null_yields_null(
+        batch_size: usize,
+        _use_perfect_hash_join_as_possible: bool,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_two_cols(("c1", &vec![None]), ("dummy", &vec![Some(10)]));
+        let right =
+            build_table_two_cols(("c2", &vec![Some(1)]), ("dummy", &vec![Some(100)]));
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("c1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("c2", &right.schema())?) as _,
+        )];
+
+        let join = null_aware_join(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::RightMark,
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+-------+------+
+            | c2 | dummy | mark |
+            +----+-------+------+
+            | 1  | 100   |      |
+            +----+-------+------+
+            ");
+        }
+        Ok(())
     }
 
     #[test]

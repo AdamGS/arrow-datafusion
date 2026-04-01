@@ -254,6 +254,26 @@ pub fn build_join_schema(
     right: &Schema,
     join_type: &JoinType,
 ) -> (Schema, Vec<ColumnIndex>) {
+    build_join_schema_impl(left, right, join_type, false)
+}
+
+/// Like [`build_join_schema`] but allows specifying whether the mark column
+/// (for LeftMark/RightMark joins) should be nullable.
+pub fn build_join_schema_nullable_mark(
+    left: &Schema,
+    right: &Schema,
+    join_type: &JoinType,
+    nullable_mark: bool,
+) -> (Schema, Vec<ColumnIndex>) {
+    build_join_schema_impl(left, right, join_type, nullable_mark)
+}
+
+fn build_join_schema_impl(
+    left: &Schema,
+    right: &Schema,
+    join_type: &JoinType,
+    nullable_mark: bool,
+) -> (Schema, Vec<ColumnIndex>) {
     let left_fields = || {
         left.fields()
             .iter()
@@ -295,7 +315,7 @@ pub fn build_join_schema(
         JoinType::LeftSemi | JoinType::LeftAnti => left_fields().unzip(),
         JoinType::LeftMark => {
             let right_field = once((
-                Field::new("mark", DataType::Boolean, false),
+                Field::new("mark", DataType::Boolean, nullable_mark),
                 ColumnIndex {
                     index: 0,
                     side: JoinSide::None,
@@ -306,7 +326,7 @@ pub fn build_join_schema(
         JoinType::RightSemi | JoinType::RightAnti => right_fields().unzip(),
         JoinType::RightMark => {
             let left_field = once((
-                Field::new("mark", DataType::Boolean, false),
+                Field::new("mark", DataType::Boolean, nullable_mark),
                 ColumnIndex {
                     index: 0,
                     side: JoinSide::None,
@@ -1801,7 +1821,7 @@ pub(super) fn equal_rows_arr(
 }
 
 // version of eq_dyn supporting equality on null arrays
-fn eq_dyn_null(
+pub(crate) fn eq_dyn_null(
     left: &dyn Array,
     right: &dyn Array,
     null_equality: NullEquality,
