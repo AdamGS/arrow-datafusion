@@ -51,7 +51,6 @@ use arrow::array::{
     UInt64Array,
 };
 use arrow::compute::kernels::boolean::and_kleene;
-use arrow::compute::take;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion_common::cast::as_boolean_array;
@@ -628,8 +627,6 @@ impl HashJoinStream {
 
         let timer = self.join_metrics.join_time.timer();
 
-        let mut null_aware_mark_input = None;
-
         {
             let state = self.state.try_as_process_probe_batch_mut()?;
             let build_side = self.build_side.try_as_ready_mut()?;
@@ -671,48 +668,7 @@ impl HashJoinStream {
                     return Ok(StatefulStreamResult::Continue);
                 }
 
-                // Null-aware mark joins must evaluate the full predicate directly so
-                // FALSE/NULL/TRUE are derived from the actual comparison result.
-                if matches!(self.join_type, JoinType::LeftMark | JoinType::RightMark) {
-                    null_aware_mark_input = Some((
-                        Arc::clone(&build_side.left_data),
-                        state.batch.clone(),
-                        state.values.clone(),
-                    ));
-                }
             }
-        }
-
-        if let Some((left_data, probe_batch, probe_values)) = null_aware_mark_input {
-            let push_status = match self.join_type {
-                JoinType::LeftMark => {
-                    self.update_null_aware_left_mark_state(
-                        &left_data,
-                        &probe_batch,
-                        &probe_values,
-                    )?;
-                    None
-                }
-                JoinType::RightMark => Some(self.output_buffer.push_batch(
-                    self.build_null_aware_right_mark_batch(
-                        &left_data,
-                        &probe_batch,
-                        &probe_values,
-                    )?,
-                )?),
-                _ => unreachable!(),
-            };
-
-            timer.done();
-
-            if push_status == Some(PushBatchStatus::LimitReached) {
-                self.output_buffer.finish()?;
-                self.state = HashJoinStreamState::Completed;
-                return Ok(StatefulStreamResult::Continue);
-            }
-
-            self.state = HashJoinStreamState::FetchProbeBatch;
-            return Ok(StatefulStreamResult::Continue);
         }
 
         let state = self.state.try_as_process_probe_batch_mut()?;
@@ -781,6 +737,118 @@ impl HashJoinStream {
         self.join_metrics
             .avg_fanout
             .add_total(distinct_right_indices_count);
+
+        // Null-aware mark joins: use hash lookup results to update bitmaps directly,
+        // preserving NULL filter results for three-valued mark semantics.
+        // This replaces the O(n*m) cross-product with O(n+m) hash-based evaluation.
+        if self.null_aware && self.join_type == JoinType::LeftMark {
+            let filter_result = if let Some(filter) = &self.filter {
+                Some(evaluate_filter_preserving_nulls(
+                    build_side.left_data.batch(),
+                    &state.batch,
+                    &left_indices,
+                    &right_indices,
+                    filter,
+                )?)
+            } else {
+                None
+            };
+
+            let mut visited = build_side.left_data.visited_indices_bitmap().lock();
+            let null_bitmap_lock = build_side.left_data.null_markers_bitmap();
+            let mut null_bitmap = null_bitmap_lock
+                .as_ref()
+                .ok_or_else(|| {
+                    internal_datafusion_err!("null-aware left mark bitmap missing")
+                })?
+                .lock();
+
+            // Process hash-matched pairs: TRUE filter → visited, NULL filter → null_bitmap
+            for i in 0..left_indices.len() {
+                let build_idx = left_indices.value(i) as usize;
+                if let Some(ref mask) = filter_result {
+                    if mask.is_null(i) {
+                        null_bitmap.set_bit(build_idx, true);
+                    } else if mask.value(i) {
+                        visited.set_bit(build_idx, true);
+                    }
+                } else {
+                    visited.set_bit(build_idx, true);
+                }
+            }
+
+            // Process probe rows with NULL keys: the hash table can't find these,
+            // so we evaluate them against all build rows with a linear scan.
+            // For each NULL-key probe row × each build row, the key equality
+            // produces NULL (via and_kleene), combined with the filter result.
+            if build_side.left_data.batch().num_rows() > 0 {
+                process_null_key_probe_rows_for_left_mark(
+                    &state.values,
+                    &build_side.left_data,
+                    &state.batch,
+                    self.filter.as_ref(),
+                    &mut visited,
+                    &mut null_bitmap,
+                )?;
+            }
+
+            timer.done();
+
+            if next_offset.is_none() {
+                self.state = HashJoinStreamState::FetchProbeBatch;
+            } else {
+                let last_joined_right_idx = match right_indices.len() {
+                    0 => None,
+                    n => Some(right_indices.value(n - 1) as usize),
+                };
+                state.advance(
+                    next_offset.ok_or_else(|| {
+                        internal_datafusion_err!("unexpected None offset")
+                    })?,
+                    last_joined_right_idx,
+                );
+            }
+            return Ok(StatefulStreamResult::Continue);
+        }
+
+        if self.null_aware && self.join_type == JoinType::RightMark {
+            let batch = build_null_aware_right_mark_from_hash(
+                &self.schema,
+                build_side.left_data.batch(),
+                &state.batch,
+                &left_indices,
+                &right_indices,
+                self.filter.as_ref(),
+                &self.column_indices,
+                build_side.left_data.values(),
+                &state.values,
+            )?;
+
+            let push_status = self.output_buffer.push_batch(batch)?;
+            timer.done();
+
+            if push_status == PushBatchStatus::LimitReached {
+                self.output_buffer.finish()?;
+                self.state = HashJoinStreamState::Completed;
+                return Ok(StatefulStreamResult::Continue);
+            }
+
+            if next_offset.is_none() {
+                self.state = HashJoinStreamState::FetchProbeBatch;
+            } else {
+                let last_joined_right_idx = match right_indices.len() {
+                    0 => None,
+                    n => Some(right_indices.value(n - 1) as usize),
+                };
+                state.advance(
+                    next_offset.ok_or_else(|| {
+                        internal_datafusion_err!("unexpected None offset")
+                    })?,
+                    last_joined_right_idx,
+                );
+            }
+            return Ok(StatefulStreamResult::Continue);
+        }
 
         // apply join filter if exists
         let (left_indices, right_indices) = if let Some(filter) = &self.filter {
@@ -1013,71 +1081,6 @@ impl HashJoinStream {
 
         Ok(StatefulStreamResult::Continue)
     }
-    fn update_null_aware_left_mark_state(
-        &self,
-        left_data: &JoinLeftData,
-        probe_batch: &RecordBatch,
-        probe_values: &[ArrayRef],
-    ) -> Result<()> {
-        if left_data.batch().num_rows() == 0 || probe_batch.num_rows() == 0 {
-            return Ok(());
-        }
-
-        let mut visited_bitmap = left_data.visited_indices_bitmap().lock();
-        let mut null_bitmap = left_data
-            .null_markers_bitmap()
-            .ok_or_else(|| {
-                internal_datafusion_err!("null-aware left mark bitmap missing")
-            })?
-            .lock();
-
-        for probe_row_idx in 0..probe_batch.num_rows() {
-            let predicate = evaluate_null_aware_mark_predicate_for_right_row(
-                left_data,
-                probe_batch,
-                probe_values,
-                probe_row_idx,
-                self.filter.as_ref(),
-                self.null_equality,
-            )?;
-            update_null_aware_mark_bitmaps(
-                &predicate,
-                &mut visited_bitmap,
-                &mut null_bitmap,
-            );
-        }
-
-        Ok(())
-    }
-
-    fn build_null_aware_right_mark_batch(
-        &self,
-        left_data: &JoinLeftData,
-        probe_batch: &RecordBatch,
-        probe_values: &[ArrayRef],
-    ) -> Result<RecordBatch> {
-        let mut mark_builder = BooleanBuilder::with_capacity(probe_batch.num_rows());
-
-        for probe_row_idx in 0..probe_batch.num_rows() {
-            let predicate = evaluate_null_aware_mark_predicate_for_right_row(
-                left_data,
-                probe_batch,
-                probe_values,
-                probe_row_idx,
-                self.filter.as_ref(),
-                self.null_equality,
-            )?;
-            append_null_aware_mark(&mut mark_builder, null_aware_mark_state(&predicate));
-        }
-
-        build_mark_join_batch(
-            &self.schema,
-            probe_batch,
-            &self.column_indices,
-            JoinSide::Right,
-            Arc::new(mark_builder.finish()),
-        )
-    }
 
     fn build_null_aware_left_mark_batch(
         &self,
@@ -1091,12 +1094,20 @@ impl HashJoinStream {
             })?
             .lock();
 
-        let mut mark_builder =
-            BooleanBuilder::with_capacity(left_data.batch().num_rows());
-        for left_row_idx in 0..left_data.batch().num_rows() {
-            if visited_bitmap.get_bit(left_row_idx) {
+        let probe_non_empty = left_data.probe_side_non_empty.load(Ordering::Relaxed);
+
+        let num_rows = left_data.batch().num_rows();
+        let mut mark_builder = BooleanBuilder::with_capacity(num_rows);
+
+        for idx in 0..num_rows {
+            if visited_bitmap.get_bit(idx) {
                 mark_builder.append_value(true);
-            } else if null_bitmap.get_bit(left_row_idx) {
+            } else if null_bitmap.get_bit(idx) {
+                // NULL from hash-match filter or from NULL-key probe row scan
+                mark_builder.append_null();
+            } else if probe_non_empty && build_row_has_null_key(left_data.values(), idx) {
+                // Build key is NULL and probe was non-empty: comparison is always NULL
+                // (If probe was empty, NULL keys get FALSE per paper Section 5.6)
                 mark_builder.append_null();
             } else {
                 mark_builder.append_value(false);
@@ -1113,114 +1124,256 @@ impl HashJoinStream {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NullAwareMarkState {
-    False,
-    Null,
-    True,
+/// Evaluates a join filter on matched (build, probe) pairs, returning the raw
+/// BooleanArray with NULLs preserved (unlike `apply_join_filter_to_indices`
+/// which treats NULLs as FALSE).
+fn evaluate_filter_preserving_nulls(
+    build_batch: &RecordBatch,
+    probe_batch: &RecordBatch,
+    build_indices: &UInt64Array,
+    probe_indices: &UInt32Array,
+    filter: &JoinFilter,
+) -> Result<BooleanArray> {
+    let intermediate_batch = build_batch_from_indices(
+        filter.schema(),
+        build_batch,
+        probe_batch,
+        build_indices,
+        probe_indices,
+        filter.column_indices(),
+        JoinSide::Left,
+        JoinType::Inner,
+    )?;
+    let result = filter
+        .expression()
+        .evaluate(&intermediate_batch)?
+        .into_array(intermediate_batch.num_rows())?;
+    Ok(as_boolean_array(&result)?.clone())
 }
 
-fn null_aware_mark_state(predicate: &BooleanArray) -> NullAwareMarkState {
-    let mut saw_null = false;
-
-    for idx in 0..predicate.len() {
-        if predicate.is_null(idx) {
-            saw_null = true;
-        } else if predicate.value(idx) {
-            return NullAwareMarkState::True;
-        }
-    }
-
-    if saw_null {
-        NullAwareMarkState::Null
-    } else {
-        NullAwareMarkState::False
-    }
+/// Returns true if the build row at `idx` has a NULL value in any join key column.
+fn build_row_has_null_key(build_values: &[ArrayRef], idx: usize) -> bool {
+    build_values.iter().any(|col| col.is_null(idx))
 }
 
-fn append_null_aware_mark(mark_builder: &mut BooleanBuilder, state: NullAwareMarkState) {
-    match state {
-        NullAwareMarkState::True => mark_builder.append_value(true),
-        NullAwareMarkState::False => mark_builder.append_value(false),
-        NullAwareMarkState::Null => mark_builder.append_null(),
-    }
-}
-
-fn update_null_aware_mark_bitmaps(
-    predicate: &BooleanArray,
-    visited_bitmap: &mut BooleanBufferBuilder,
-    null_bitmap: &mut BooleanBufferBuilder,
-) {
-    for left_row_idx in 0..predicate.len() {
-        if predicate.is_null(left_row_idx) {
-            null_bitmap.set_bit(left_row_idx, true);
-        } else if predicate.value(left_row_idx) {
-            visited_bitmap.set_bit(left_row_idx, true);
-        }
-    }
-}
-
-fn evaluate_null_aware_mark_predicate_for_right_row(
+/// For probe rows that have NULL in any join key, evaluate the full predicate
+/// (key equality + filter) against all build rows using a linear scan.
+///
+/// The hash table cannot find matches for NULL keys, but NULL comparisons
+/// may still produce NULL (not FALSE) results that affect the mark column.
+/// For multi-key joins, only build rows where the non-NULL keys match get
+/// a NULL mark (and_kleene of TRUE and NULL = NULL, but and_kleene of FALSE
+/// and NULL = FALSE).
+fn process_null_key_probe_rows_for_left_mark(
+    probe_values: &[ArrayRef],
     left_data: &JoinLeftData,
     probe_batch: &RecordBatch,
-    probe_values: &[ArrayRef],
-    probe_row_idx: usize,
     filter: Option<&JoinFilter>,
-    null_equality: NullEquality,
-) -> Result<BooleanArray> {
-    let left_row_count = left_data.batch().num_rows();
-    if left_row_count == 0 {
-        return Ok(BooleanBuilder::with_capacity(0).finish());
+    visited: &mut BooleanBufferBuilder,
+    null_bitmap: &mut BooleanBufferBuilder,
+) -> Result<()> {
+    let build_count = left_data.batch().num_rows();
+    let probe_count = probe_batch.num_rows();
+
+    for probe_row in 0..probe_count {
+        // Skip probe rows without any NULL key
+        if !probe_values.iter().any(|col| col.is_null(probe_row)) {
+            continue;
+        }
+
+        // Evaluate key equality for this probe row against all build rows.
+        // Uses and_kleene so NULL keys produce NULL results (not FALSE).
+        let all_build = UInt64Array::from_iter_values(0..build_count as u64);
+        let repeated_probe =
+            UInt32Array::from(vec![probe_row as u32; build_count]);
+
+        let mut predicate: Option<BooleanArray> = None;
+        for (build_key, probe_key) in left_data.values().iter().zip(probe_values.iter()) {
+            let repeated = arrow::compute::take(probe_key.as_ref(), &repeated_probe, None)?;
+            let eq = eq_dyn_null(build_key.as_ref(), repeated.as_ref(), NullEquality::NullEqualsNothing)?;
+            predicate = Some(match predicate {
+                Some(current) => and_kleene(&current, &eq)?,
+                None => eq,
+            });
+        }
+
+        // Apply residual filter if present
+        if let Some(filter) = filter {
+            let filter_batch = build_batch_from_indices(
+                filter.schema(),
+                left_data.batch(),
+                probe_batch,
+                &all_build,
+                &repeated_probe,
+                filter.column_indices(),
+                JoinSide::Left,
+                JoinType::Inner,
+            )?;
+            let filter_result = filter
+                .expression()
+                .evaluate(&filter_batch)?
+                .into_array(filter_batch.num_rows())?;
+            let filter_arr = as_boolean_array(&filter_result)?;
+            predicate = Some(match predicate {
+                Some(current) => and_kleene(&current, filter_arr)?,
+                None => filter_arr.clone(),
+            });
+        }
+
+        if let Some(pred) = predicate {
+            for build_row in 0..build_count {
+                if pred.is_null(build_row) {
+                    null_bitmap.set_bit(build_row, true);
+                } else if pred.value(build_row) {
+                    visited.set_bit(build_row, true);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Builds a null-aware RightMark batch using hash-lookup results.
+///
+/// For each probe row, determines the three-valued mark by combining:
+/// 1. Hash-lookup matches (fast path for non-NULL keys)
+/// 2. Linear scan for NULL-key interactions (probe NULL or build NULL)
+fn build_null_aware_right_mark_from_hash(
+    schema: &SchemaRef,
+    build_batch: &RecordBatch,
+    probe_batch: &RecordBatch,
+    build_indices: &UInt64Array,
+    probe_indices: &UInt32Array,
+    filter: Option<&JoinFilter>,
+    column_indices: &[ColumnIndex],
+    build_values: &[ArrayRef],
+    probe_values: &[ArrayRef],
+) -> Result<RecordBatch> {
+    let num_probe_rows = probe_batch.num_rows();
+    let num_build_rows = build_batch.num_rows();
+
+    // Evaluate filter on hash-matched pairs, preserving NULLs
+    let filter_result = if let Some(filter) = filter {
+        if !build_indices.is_empty() {
+            Some(evaluate_filter_preserving_nulls(
+                build_batch,
+                probe_batch,
+                build_indices,
+                probe_indices,
+                filter,
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // For each probe row, compute three-valued mark
+    let mut mark_builder = BooleanBuilder::with_capacity(num_probe_rows);
+
+    let mut match_idx = 0;
+    for probe_row in 0..num_probe_rows {
+        let mut saw_true = false;
+        let mut saw_null = false;
+
+        // 1) Hash-matched pairs for this probe row
+        while match_idx < probe_indices.len()
+            && (probe_indices.value(match_idx) as usize) == probe_row
+        {
+            if let Some(ref mask) = filter_result {
+                if mask.is_null(match_idx) {
+                    saw_null = true;
+                } else if mask.value(match_idx) {
+                    saw_true = true;
+                }
+            } else {
+                saw_true = true;
+            }
+            match_idx += 1;
+        }
+
+        // 2) If not already TRUE, check NULL-key interactions via linear scan.
+        //    This handles: probe row with NULL key, or build rows with NULL keys.
+        if !saw_true && num_build_rows > 0 {
+            let probe_has_null =
+                probe_values.iter().any(|col| col.is_null(probe_row));
+            let build_has_any_null =
+                (0..num_build_rows).any(|i| build_row_has_null_key(build_values, i));
+
+            if probe_has_null || build_has_any_null {
+                // Evaluate full predicate for this probe row against all build rows
+                let all_build =
+                    UInt64Array::from_iter_values(0..num_build_rows as u64);
+                let repeated_probe =
+                    UInt32Array::from(vec![probe_row as u32; num_build_rows]);
+
+                let mut pred: Option<BooleanArray> = None;
+                for (bk, pk) in build_values.iter().zip(probe_values.iter()) {
+                    let rep =
+                        arrow::compute::take(pk.as_ref(), &repeated_probe, None)?;
+                    let eq = eq_dyn_null(
+                        bk.as_ref(),
+                        rep.as_ref(),
+                        NullEquality::NullEqualsNothing,
+                    )?;
+                    pred = Some(match pred {
+                        Some(c) => and_kleene(&c, &eq)?,
+                        None => eq,
+                    });
+                }
+
+                if let Some(f) = filter {
+                    let fb = build_batch_from_indices(
+                        f.schema(),
+                        build_batch,
+                        probe_batch,
+                        &all_build,
+                        &repeated_probe,
+                        f.column_indices(),
+                        JoinSide::Left,
+                        JoinType::Inner,
+                    )?;
+                    let fr = f
+                        .expression()
+                        .evaluate(&fb)?
+                        .into_array(fb.num_rows())?;
+                    let fa = as_boolean_array(&fr)?;
+                    pred = Some(match pred {
+                        Some(c) => and_kleene(&c, fa)?,
+                        None => fa.clone(),
+                    });
+                }
+
+                if let Some(p) = pred {
+                    for i in 0..p.len() {
+                        if p.is_null(i) {
+                            saw_null = true;
+                        } else if p.value(i) {
+                            saw_true = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if saw_true {
+            mark_builder.append_value(true);
+        } else if saw_null {
+            mark_builder.append_null();
+        } else {
+            mark_builder.append_value(false);
+        }
     }
 
-    let left_indices = UInt64Array::from_iter_values(0..left_row_count as u64);
-    let repeated_probe_indices =
-        UInt32Array::from(vec![probe_row_idx as u32; left_row_count]);
-
-    let mut predicate = None;
-
-    for (left_key, probe_key) in left_data.values().iter().zip(probe_values.iter()) {
-        let repeated_probe_key = take(probe_key.as_ref(), &repeated_probe_indices, None)?;
-        let equality = eq_dyn_null(
-            left_key.as_ref(),
-            repeated_probe_key.as_ref(),
-            null_equality,
-        )?;
-        predicate = Some(match predicate {
-            Some(current) => and_kleene(&current, &equality)?,
-            None => equality,
-        });
-    }
-
-    if let Some(filter) = filter {
-        let filter_batch = build_batch_from_indices(
-            filter.schema(),
-            left_data.batch(),
-            probe_batch,
-            &left_indices,
-            &repeated_probe_indices,
-            filter.column_indices(),
-            JoinSide::Left,
-            JoinType::Inner,
-        )?;
-
-        let filter_result = filter
-            .expression()
-            .evaluate(&filter_batch)?
-            .into_array(filter_batch.num_rows())?;
-        let filter_result = as_boolean_array(&filter_result)?.clone();
-
-        predicate = Some(match predicate {
-            Some(current) => and_kleene(&current, &filter_result)?,
-            None => filter_result,
-        });
-    }
-
-    predicate.ok_or_else(|| {
-        internal_datafusion_err!(
-            "null-aware mark join requires at least one equality key or filter"
-        )
-    })
+    build_mark_join_batch(
+        schema,
+        probe_batch,
+        column_indices,
+        JoinSide::Right,
+        Arc::new(mark_builder.finish()),
+    )
 }
 
 fn build_mark_join_batch(
