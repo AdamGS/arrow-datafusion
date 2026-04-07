@@ -6296,6 +6296,143 @@ mod tests {
         Ok(())
     }
 
+    /// A NULL build key must stay FALSE if another extracted equality key
+    /// already rejects every candidate row.
+    #[rstest]
+    #[tokio::test]
+    async fn test_null_aware_left_mark_build_null_with_other_key_false_stays_false(
+        #[values(8192, 10, 5, 2, 1)] batch_size: usize,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_two_cols(("k1", &vec![None]), ("k2", &vec![Some(10)]));
+        let right = build_table_two_cols(("k1", &vec![Some(1)]), ("k2", &vec![Some(20)]));
+        let on = vec![
+            (
+                Arc::new(Column::new_with_schema("k1", &left.schema())?) as _,
+                Arc::new(Column::new_with_schema("k1", &right.schema())?) as _,
+            ),
+            (
+                Arc::new(Column::new_with_schema("k2", &left.schema())?) as _,
+                Arc::new(Column::new_with_schema("k2", &right.schema())?) as _,
+            ),
+        ];
+
+        let join = null_aware_join(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::LeftMark,
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+----+-------+
+            | k1 | k2 | mark  |
+            +----+----+-------+
+            |    | 10 | false |
+            +----+----+-------+
+            ");
+        }
+        Ok(())
+    }
+
+    /// Per HyPer Section 5.6, NULL-key build rows must become FALSE if the probe
+    /// side is empty.
+    #[rstest]
+    #[tokio::test]
+    async fn test_null_aware_left_mark_empty_probe_turns_build_null_false(
+        #[values(8192, 10, 5, 2, 1)] batch_size: usize,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_two_cols(
+            ("k", &vec![None, Some(1)]),
+            ("v", &vec![Some(10), Some(20)]),
+        );
+        let right = build_table_two_cols(("k", &vec![]), ("v", &vec![]));
+        let on = vec![(
+            Arc::new(Column::new_with_schema("k", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("k", &right.schema())?) as _,
+        )];
+
+        let join = null_aware_join(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::LeftMark,
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +---+----+-------+
+            | k | v  | mark  |
+            +---+----+-------+
+            |   | 10 | false |
+            | 1 | 20 | false |
+            +---+----+-------+
+            ");
+        }
+        Ok(())
+    }
+
+    /// Per HyPer Section 5.6, once a NULL probe key is seen, unmatched rows
+    /// become NULL, but exact matches still remain TRUE.
+    #[rstest]
+    #[tokio::test]
+    async fn test_null_aware_left_mark_true_dominates_probe_null(
+        #[values(8192, 10, 5, 2, 1)] batch_size: usize,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_two_cols(
+            ("k", &vec![Some(1), Some(2)]),
+            ("v", &vec![Some(10), Some(20)]),
+        );
+        let right = build_table_two_cols(
+            ("k", &vec![Some(1), None]),
+            ("v", &vec![Some(100), Some(200)]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("k", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("k", &right.schema())?) as _,
+        )];
+
+        let join = null_aware_join(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::LeftMark,
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +---+----+------+
+            | k | v  | mark |
+            +---+----+------+
+            | 1 | 10 | true |
+            | 2 | 20 |      |
+            +---+----+------+
+            ");
+        }
+        Ok(())
+    }
+
     /// Test that null_aware validation rejects non-LeftAnti join types
     #[tokio::test]
     async fn test_null_aware_validation_wrong_join_type() {
@@ -6405,6 +6542,96 @@ mod tests {
             +----+-------+------+
             | 1  | 100   |      |
             +----+-------+------+
+            ");
+        }
+        Ok(())
+    }
+
+    /// A paginated hash lookup must still emit one marker per probe row.
+    #[rstest]
+    #[tokio::test]
+    async fn test_null_aware_right_mark_paginated_probe_row_emitted_once(
+        #[values(true, false)] use_perfect_hash_join_as_possible: bool,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(1, use_perfect_hash_join_as_possible);
+
+        let left = build_table_two_cols(
+            ("k", &vec![Some(1), Some(1), Some(1)]),
+            ("v", &vec![Some(10), Some(20), Some(30)]),
+        );
+        let right = build_table_two_cols(("k", &vec![Some(1)]), ("v", &vec![Some(100)]));
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("k", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("k", &right.schema())?) as _,
+        )];
+
+        let join = null_aware_join(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::RightMark,
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +---+-----+------+
+            | k | v   | mark |
+            +---+-----+------+
+            | 1 | 100 | true |
+            +---+-----+------+
+            ");
+        }
+        Ok(())
+    }
+
+    /// RightMark is analogous to LeftMark in HyPer Section 5.6: a NULL-key build
+    /// row can promote an unmatched probe row to NULL, but must not override TRUE.
+    #[rstest]
+    #[tokio::test]
+    async fn test_null_aware_right_mark_true_dominates_build_null(
+        #[values(8192, 10, 5, 2, 1)] batch_size: usize,
+    ) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_two_cols(
+            ("k", &vec![Some(1), None]),
+            ("v", &vec![Some(10), Some(20)]),
+        );
+        let right = build_table_two_cols(
+            ("k", &vec![Some(1), Some(2)]),
+            ("v", &vec![Some(100), Some(200)]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("k", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("k", &right.schema())?) as _,
+        )];
+
+        let join = null_aware_join(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::RightMark,
+            NullEquality::NullEqualsNothing,
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +---+-----+------+
+            | k | v   | mark |
+            +---+-----+------+
+            | 1 | 100 | true |
+            | 2 | 200 |      |
+            +---+-----+------+
             ");
         }
         Ok(())
