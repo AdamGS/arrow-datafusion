@@ -6153,9 +6153,9 @@ mod tests {
     #[tokio::test]
     async fn test_null_aware_left_mark_filter_null_yields_null(
         batch_size: usize,
-        _use_perfect_hash_join_as_possible: bool,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, false);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
 
         let left = build_table_two_cols(
             ("k", &vec![Some(1), Some(2), Some(3)]),
@@ -6182,6 +6182,7 @@ mod tests {
 
         let stream = join.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;
+        let metrics = join.metrics().unwrap();
 
         allow_duplicates! {
             assert_snapshot!(batches_to_sort_string(&batches), @r"
@@ -6194,6 +6195,7 @@ mod tests {
             +---+----+-------+
             ");
         }
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
         Ok(())
     }
 
@@ -6203,9 +6205,9 @@ mod tests {
     #[tokio::test]
     async fn test_null_aware_left_mark_probe_null_with_false_residual_stays_false(
         batch_size: usize,
-        _use_perfect_hash_join_as_possible: bool,
+        use_perfect_hash_join_as_possible: bool,
     ) -> Result<()> {
-        let task_ctx = prepare_task_ctx(batch_size, false);
+        let task_ctx = prepare_task_ctx(batch_size, use_perfect_hash_join_as_possible);
 
         let left = build_table_two_cols(
             ("k", &vec![Some(1), Some(2)]),
@@ -6232,6 +6234,7 @@ mod tests {
 
         let stream = join.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;
+        let metrics = join.metrics().unwrap();
 
         allow_duplicates! {
             assert_snapshot!(batches_to_sort_string(&batches), @r"
@@ -6243,16 +6246,16 @@ mod tests {
             +---+----+-------+
             ");
         }
+        assert_phj_used(&metrics, use_perfect_hash_join_as_possible);
         Ok(())
     }
 
     /// Test null-aware mark join with two extracted equality keys.
     /// Expected: FALSE remains FALSE when another key already rejects the partner.
-    #[apply(hash_join_exec_configs)]
+    #[rstest]
     #[tokio::test]
     async fn test_null_aware_left_mark_multi_key_false_stays_false(
-        batch_size: usize,
-        _use_perfect_hash_join_as_possible: bool,
+        #[values(8192, 10, 5, 2, 1)] batch_size: usize,
     ) -> Result<()> {
         let task_ctx = prepare_task_ctx(batch_size, false);
 
@@ -6367,11 +6370,10 @@ mod tests {
 
     /// Test null-aware right mark join when the build side contains a NULL key.
     /// Expected: unmatched FALSE is promoted to NULL for the probe row.
-    #[apply(hash_join_exec_configs)]
+    #[rstest]
     #[tokio::test]
     async fn test_null_aware_right_mark_build_null_yields_null(
-        batch_size: usize,
-        _use_perfect_hash_join_as_possible: bool,
+        #[values(8192, 10, 5, 2, 1)] batch_size: usize,
     ) -> Result<()> {
         let task_ctx = prepare_task_ctx(batch_size, false);
 

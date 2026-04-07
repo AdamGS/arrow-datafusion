@@ -667,7 +667,6 @@ impl HashJoinStream {
                     self.state = HashJoinStreamState::FetchProbeBatch;
                     return Ok(StatefulStreamResult::Continue);
                 }
-
             }
         }
 
@@ -1114,12 +1113,14 @@ impl HashJoinStream {
             }
         }
 
+        let mark = Arc::new(mark_builder.finish()) as ArrayRef;
+
         build_mark_join_batch(
             &self.schema,
             left_data.batch(),
             &self.column_indices,
             JoinSide::Left,
-            Arc::new(mark_builder.finish()),
+            &mark,
         )
     }
 }
@@ -1184,13 +1185,17 @@ fn process_null_key_probe_rows_for_left_mark(
         // Evaluate key equality for this probe row against all build rows.
         // Uses and_kleene so NULL keys produce NULL results (not FALSE).
         let all_build = UInt64Array::from_iter_values(0..build_count as u64);
-        let repeated_probe =
-            UInt32Array::from(vec![probe_row as u32; build_count]);
+        let repeated_probe = UInt32Array::from(vec![probe_row as u32; build_count]);
 
         let mut predicate: Option<BooleanArray> = None;
         for (build_key, probe_key) in left_data.values().iter().zip(probe_values.iter()) {
-            let repeated = arrow::compute::take(probe_key.as_ref(), &repeated_probe, None)?;
-            let eq = eq_dyn_null(build_key.as_ref(), repeated.as_ref(), NullEquality::NullEqualsNothing)?;
+            let repeated =
+                arrow::compute::take(probe_key.as_ref(), &repeated_probe, None)?;
+            let eq = eq_dyn_null(
+                build_key.as_ref(),
+                repeated.as_ref(),
+                NullEquality::NullEqualsNothing,
+            )?;
             predicate = Some(match predicate {
                 Some(current) => and_kleene(&current, &eq)?,
                 None => eq,
@@ -1238,6 +1243,7 @@ fn process_null_key_probe_rows_for_left_mark(
 /// For each probe row, determines the three-valued mark by combining:
 /// 1. Hash-lookup matches (fast path for non-NULL keys)
 /// 2. Linear scan for NULL-key interactions (probe NULL or build NULL)
+#[expect(clippy::too_many_arguments)]
 fn build_null_aware_right_mark_from_hash(
     schema: &SchemaRef,
     build_batch: &RecordBatch,
@@ -1296,22 +1302,19 @@ fn build_null_aware_right_mark_from_hash(
         // 2) If not already TRUE, check NULL-key interactions via linear scan.
         //    This handles: probe row with NULL key, or build rows with NULL keys.
         if !saw_true && num_build_rows > 0 {
-            let probe_has_null =
-                probe_values.iter().any(|col| col.is_null(probe_row));
+            let probe_has_null = probe_values.iter().any(|col| col.is_null(probe_row));
             let build_has_any_null =
                 (0..num_build_rows).any(|i| build_row_has_null_key(build_values, i));
 
             if probe_has_null || build_has_any_null {
                 // Evaluate full predicate for this probe row against all build rows
-                let all_build =
-                    UInt64Array::from_iter_values(0..num_build_rows as u64);
+                let all_build = UInt64Array::from_iter_values(0..num_build_rows as u64);
                 let repeated_probe =
                     UInt32Array::from(vec![probe_row as u32; num_build_rows]);
 
                 let mut pred: Option<BooleanArray> = None;
                 for (bk, pk) in build_values.iter().zip(probe_values.iter()) {
-                    let rep =
-                        arrow::compute::take(pk.as_ref(), &repeated_probe, None)?;
+                    let rep = arrow::compute::take(pk.as_ref(), &repeated_probe, None)?;
                     let eq = eq_dyn_null(
                         bk.as_ref(),
                         rep.as_ref(),
@@ -1334,10 +1337,7 @@ fn build_null_aware_right_mark_from_hash(
                         JoinSide::Left,
                         JoinType::Inner,
                     )?;
-                    let fr = f
-                        .expression()
-                        .evaluate(&fb)?
-                        .into_array(fb.num_rows())?;
+                    let fr = f.expression().evaluate(&fb)?.into_array(fb.num_rows())?;
                     let fa = as_boolean_array(&fr)?;
                     pred = Some(match pred {
                         Some(c) => and_kleene(&c, fa)?,
@@ -1367,13 +1367,9 @@ fn build_null_aware_right_mark_from_hash(
         }
     }
 
-    build_mark_join_batch(
-        schema,
-        probe_batch,
-        column_indices,
-        JoinSide::Right,
-        Arc::new(mark_builder.finish()),
-    )
+    let mark = Arc::new(mark_builder.finish()) as ArrayRef;
+
+    build_mark_join_batch(schema, probe_batch, column_indices, JoinSide::Right, &mark)
 }
 
 fn build_mark_join_batch(
@@ -1381,7 +1377,7 @@ fn build_mark_join_batch(
     batch: &RecordBatch,
     column_indices: &[ColumnIndex],
     batch_side: JoinSide,
-    mark: ArrayRef,
+    mark: &ArrayRef,
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(mark.len()));
@@ -1395,7 +1391,7 @@ fn build_mark_join_batch(
     let mut columns = Vec::with_capacity(column_indices.len());
     for column_index in column_indices {
         match column_index.side {
-            JoinSide::None => columns.push(Arc::clone(&mark)),
+            JoinSide::None => columns.push(Arc::clone(mark)),
             side if side == batch_side => {
                 columns.push(Arc::clone(batch.column(column_index.index)));
             }

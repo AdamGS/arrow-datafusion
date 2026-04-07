@@ -449,7 +449,6 @@ async fn test_null_aware_join_with_swap_mark() {
             .unwrap();
 
         let swapped_join = optimized_join
-            .as_any()
             .downcast_ref::<HashJoinExec>()
             .expect("The type of the plan should not be changed");
 
