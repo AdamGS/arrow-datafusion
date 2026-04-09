@@ -72,6 +72,37 @@ physical_plan
 04)------DataSourceExec: partitions=1, partition_sizes=[1]
 05)------DataSourceExec: partitions=1, partition_sizes=[1]
 
+query IT rowsort
+SELECT id, value
+FROM outer_table
+WHERE (id NOT IN (SELECT id FROM inner_table_with_null)) IS NULL;
+----
+1 a
+3 c
+4 d
+NULL e
+
+query TT
+EXPLAIN
+SELECT value
+FROM outer_table
+WHERE (id NOT IN (SELECT id FROM inner_table_with_null)) IS NULL;
+----
+logical_plan
+01)Projection: outer_table.value
+02)--Filter: NOT __correlated_sq_1.mark IS NULL
+03)----Projection: outer_table.value, __correlated_sq_1.mark
+04)------LeftMark Join: outer_table.id = __correlated_sq_1.id
+05)--------TableScan: outer_table projection=[id, value]
+06)--------SubqueryAlias: __correlated_sq_1
+07)----------TableScan: inner_table_with_null projection=[id]
+physical_plan
+01)FilterExec: NOT mark@1 IS NULL, projection=[value@0]
+02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
+03)----HashJoinExec: mode=CollectLeft, join_type=LeftMark, on=[(id@0, id@0)], projection=[value@1, mark@2]
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+05)------DataSourceExec: partitions=1, partition_sizes=[1]
+
 query T rowsort
 SELECT value
 FROM outer_table
@@ -121,8 +152,30 @@ c
 d
 e
 
+query TT
+EXPLAIN
+SELECT value
+FROM outer_table
+WHERE (id NOT IN (SELECT id FROM empty_table)) IS TRUE;
+----
+logical_plan
+01)Projection: outer_table.value
+02)--Filter: NOT __correlated_sq_1.mark IS TRUE
+03)----Projection: outer_table.value, __correlated_sq_1.mark
+04)------LeftMark Join: outer_table.id = __correlated_sq_1.id
+05)--------TableScan: outer_table projection=[id, value]
+06)--------SubqueryAlias: __correlated_sq_1
+07)----------TableScan: empty_table projection=[id]
+physical_plan
+01)FilterExec: NOT mark@1 IS NOT DISTINCT FROM true, projection=[value@0]
+02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
+03)----HashJoinExec: mode=CollectLeft, join_type=LeftMark, on=[(id@0, id@0)], projection=[value@1, mark@2]
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+05)------DataSourceExec: partitions=1, partition_sizes=[0]
+
 ###################################
 ## Sort-merge join null-aware mark
+As of this work, sort-merge join actually don't support null-aware semantics, so they still end up using a hash-join.
 ###################################
 
 statement ok
@@ -149,12 +202,20 @@ logical_plan
 06)--------TableScan: inner_table_with_null projection=[id]
 physical_plan
 01)FilterExec: NOT mark@2 IS NULL, projection=[id@0, value@1]
-02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1, maintains_sort_order=true
-03)----SortMergeJoinExec: join_type=LeftMark, on=[(id@0, id@0)]
-04)------SortExec: expr=[id@0 ASC], preserve_partitioning=[false]
-05)--------DataSourceExec: partitions=1, partition_sizes=[1]
-06)------SortExec: expr=[id@0 ASC], preserve_partitioning=[false]
-07)--------DataSourceExec: partitions=1, partition_sizes=[1]
+02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
+03)----HashJoinExec: mode=CollectLeft, join_type=LeftMark, on=[(id@0, id@0)]
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+05)------DataSourceExec: partitions=1, partition_sizes=[1]
+
+query IT rowsort
+SELECT id, value
+FROM outer_table
+WHERE (id NOT IN (SELECT id FROM inner_table_with_null)) IS NULL;
+----
+1 a
+3 c
+4 d
+NULL e
 
 query TT
 EXPLAIN
@@ -173,12 +234,9 @@ logical_plan
 physical_plan
 01)FilterExec: NOT mark@1 IS NULL, projection=[value@0]
 02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
-03)----ProjectionExec: expr=[value@1 as value, mark@2 as mark]
-04)------SortMergeJoinExec: join_type=LeftMark, on=[(id@0, id@0)]
-05)--------SortExec: expr=[id@0 ASC], preserve_partitioning=[false]
-06)----------DataSourceExec: partitions=1, partition_sizes=[1]
-07)--------SortExec: expr=[id@0 ASC], preserve_partitioning=[false]
-08)----------DataSourceExec: partitions=1, partition_sizes=[1]
+03)----HashJoinExec: mode=CollectLeft, join_type=LeftMark, on=[(id@0, id@0)], projection=[value@1, mark@2]
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+05)------DataSourceExec: partitions=1, partition_sizes=[1]
 
 query T rowsort
 SELECT value
@@ -196,6 +254,27 @@ FROM outer_table
 WHERE (id NOT IN (SELECT id FROM inner_table_no_null)) IS NULL;
 ----
 e
+
+query TT
+EXPLAIN
+SELECT value
+FROM outer_table
+WHERE (id NOT IN (SELECT id FROM inner_table_no_null)) IS NULL;
+----
+logical_plan
+01)Projection: outer_table.value
+02)--Filter: NOT __correlated_sq_1.mark IS NULL
+03)----Projection: outer_table.value, __correlated_sq_1.mark
+04)------LeftMark Join: outer_table.id = __correlated_sq_1.id
+05)--------TableScan: outer_table projection=[id, value]
+06)--------SubqueryAlias: __correlated_sq_1
+07)----------TableScan: inner_table_no_null projection=[id]
+physical_plan
+01)FilterExec: NOT mark@1 IS NULL, projection=[value@0]
+02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
+03)----HashJoinExec: mode=CollectLeft, join_type=LeftMark, on=[(id@0, id@0)], projection=[value@1, mark@2]
+04)------DataSourceExec: partitions=1, partition_sizes=[1]
+05)------DataSourceExec: partitions=1, partition_sizes=[1]
 
 ####################################
 ## Nested loop mark join with NULLs
