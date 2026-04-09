@@ -166,7 +166,6 @@ WHERE id NOT IN (SELECT id FROM inner_table_no_null)
 2 b
 3 c
 4 d
-NULL e
 
 #############
 ## Test 10: NOT IN with WHERE clause in subquery

@@ -5838,7 +5838,7 @@ mod tests {
 
                     assert!(!fields[0].is_nullable());
                     assert!(!fields[1].is_nullable());
-                    assert!(!fields[2].is_nullable());
+                    assert!(fields[2].is_nullable());
                 }
                 _ => {
                     assert_eq!(join.schema.fields().len(), 4);

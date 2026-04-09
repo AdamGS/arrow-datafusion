@@ -303,7 +303,7 @@ pub fn build_join_schema(
         JoinType::LeftSemi | JoinType::LeftAnti => left_fields().unzip(),
         JoinType::LeftMark => {
             let right_field = once((
-                Field::new("mark", DataType::Boolean, false),
+                Field::new("mark", DataType::Boolean, true),
                 ColumnIndex {
                     index: 0,
                     side: JoinSide::None,
@@ -314,7 +314,7 @@ pub fn build_join_schema(
         JoinType::RightSemi | JoinType::RightAnti => right_fields().unzip(),
         JoinType::RightMark => {
             let left_field = once((
-                Field::new("mark", DataType::Boolean, false),
+                Field::new("mark", DataType::Boolean, true),
                 ColumnIndex {
                     index: 0,
                     side: JoinSide::None,
@@ -1065,6 +1065,7 @@ pub(crate) fn apply_join_filter_to_indices(
                 filter.column_indices(),
                 build_side,
                 join_type,
+                None,
             )?;
             let filter_result = filter
                 .expression()
@@ -1087,6 +1088,7 @@ pub(crate) fn apply_join_filter_to_indices(
             filter.column_indices(),
             build_side,
             join_type,
+            None,
         )?;
 
         filter
@@ -1128,6 +1130,7 @@ pub(crate) fn build_batch_from_indices(
     column_indices: &[ColumnIndex],
     build_side: JoinSide,
     join_type: JoinType,
+    mark_column: Option<&ArrayRef>,
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         // For RightAnti and RightSemi joins, after `adjust_indices_by_join_type`
@@ -1148,7 +1151,10 @@ pub(crate) fn build_batch_from_indices(
     for column_index in column_indices {
         let array = if column_index.side == JoinSide::None {
             // For mark joins, the mark column is a true if the indices is not null, otherwise it will be false
-            Arc::new(compute::is_not_null(probe_indices)?)
+            match mark_column {
+                Some(mark_col) => Arc::clone(mark_col),
+                None => Arc::new(compute::is_not_null(probe_indices)?),
+            }
         } else if column_index.side == build_side {
             let array = build_input_buffer.column(column_index.index);
             if array.is_empty() || build_indices.null_count() == build_indices.len() {

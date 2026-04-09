@@ -211,11 +211,15 @@ pub(super) struct JoinLeftData {
     /// Membership testing strategy for filter pushdown
     /// Contains either InList values for small build sides or hash table reference for large build sides
     pub(super) membership: PushdownStrategy,
-    /// Shared atomic flag indicating if any probe partition saw data (for null-aware anti joins)
+    /// Shared atomic flag indicating if any probe partition saw data (for null-aware anti/mark joins)
     /// This is shared across all probe partitions to provide global knowledge
     pub(super) probe_side_non_empty: AtomicBool,
     /// Shared atomic flag indicating if any probe partition saw NULL in join keys (for null-aware anti joins)
     pub(super) probe_side_has_null: AtomicBool,
+    /// Shared atomic flag indicating if any build partition saw NULL in join keys (for null-aware mark joins)
+    pub(super) build_side_has_nulls: AtomicBool,
+    /// Not sure how to use this yet
+    pub(super) build_side_is_empty: AtomicBool,
 }
 
 impl JoinLeftData {
@@ -2063,6 +2067,9 @@ async fn collect_left_input(
         bounds = None;
     }
 
+    let build_side_has_nulls = batch.columns().iter().any(|col| col.null_count() > 0);
+    let build_side_is_empty = batch.num_rows() == 0;
+
     let data = JoinLeftData {
         map,
         batch,
@@ -2074,6 +2081,8 @@ async fn collect_left_input(
         membership,
         probe_side_non_empty: AtomicBool::new(false),
         probe_side_has_null: AtomicBool::new(false),
+        build_side_has_nulls: AtomicBool::new(build_side_has_nulls),
+        build_side_is_empty: AtomicBool::new(build_side_is_empty),
     };
 
     Ok(data)

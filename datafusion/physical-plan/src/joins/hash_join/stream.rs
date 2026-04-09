@@ -47,7 +47,7 @@ use crate::{
     },
 };
 
-use arrow::array::{Array, ArrayRef, UInt32Array, UInt64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{
@@ -240,7 +240,7 @@ pub(super) struct HashJoinStream {
     /// Output buffer for coalescing small batches into larger ones with optional fetch limit.
     /// Uses `LimitedBatchCoalescer` to efficiently combine batches and absorb limit with 'fetch'
     output_buffer: LimitedBatchCoalescer,
-    /// Whether this is a null-aware anti join
+    /// Whether this is a null-aware anti or mark joins
     null_aware: bool,
 }
 
@@ -814,6 +814,54 @@ impl HashJoinStream {
                 (build_side.left_data.batch(), &state.batch, JoinSide::Left)
             };
 
+        let mark_column = if self.null_aware && self.join_type == JoinType::LeftMark {
+            let build_has_nulls = build_side
+                .left_data
+                .build_side_has_nulls
+                .load(Ordering::Relaxed);
+            let build_is_empty = build_side
+                .left_data
+                .build_side_is_empty
+                .load(Ordering::Relaxed);
+
+            // Since null_aware validation ensures single column join, we only check the first column
+            let probe_key_column = &probe_batch.column(0);
+
+            Some(Arc::new(
+                (0..probe_key_column.len())
+                    .map(|idx| {
+                        if right_indices.is_valid(idx) {
+                            Some(true)
+                        } else if probe_key_column.is_valid(idx) && !build_has_nulls {
+                            Some(false)
+                        } else if (probe_key_column.is_valid(idx) && build_has_nulls)
+                            || (probe_key_column.is_null(idx) && !build_is_empty)
+                        {
+                            None
+                        } else if probe_key_column.is_null(idx) && build_is_empty {
+                            Some(false)
+                        } else {
+                            unreachable!("Should cover all cases");
+                        }
+                    })
+                    .collect::<BooleanArray>(),
+            ) as ArrayRef)
+
+            // todo!()
+            // Some(Arc::new(
+            //     right_indices
+            //         .iter()
+            //         .map(|v| match v {
+            //             Some(_) => Some(true),
+            //             None if !build_has_nulls => Some(false),
+            //             None if build_has_nulls => None,
+            //         })
+            //         .collect::<BooleanArray>(),
+            // ))
+        } else {
+            None
+        };
+
         let batch = build_batch_from_indices(
             &self.schema,
             build_batch,
@@ -823,6 +871,7 @@ impl HashJoinStream {
             &self.column_indices,
             join_side,
             self.join_type,
+            mark_column.as_ref(),
         )?;
 
         let push_status = self.output_buffer.push_batch(batch)?;
@@ -942,6 +991,7 @@ impl HashJoinStream {
                 &self.column_indices,
                 JoinSide::Left,
                 self.join_type,
+                None,
             )?;
             let push_status = self.output_buffer.push_batch(batch)?;
 

@@ -1664,7 +1664,7 @@ fn mark_field(schema: &DFSchema) -> (Option<TableReference>, Arc<Field>) {
 
     (
         table_reference,
-        Arc::new(Field::new("mark", DataType::Boolean, false)),
+        Arc::new(Field::new("mark", DataType::Boolean, true)),
     )
 }
 

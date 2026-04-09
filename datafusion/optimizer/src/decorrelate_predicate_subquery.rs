@@ -469,9 +469,13 @@ fn build_join(
     //
     // Additionally, if the join keys are non-nullable on both sides, we don't need
     // null-aware semantics because NULLs cannot exist in the data.
-    let null_aware = join_type == JoinType::LeftAnti
-        && in_predicate_opt.is_some()
-        && join_keys_may_be_null(&join_filter, left.schema(), sub_query_alias.schema())?;
+    let null_aware = dbg!(matches!(join_type, JoinType::LeftAnti | JoinType::LeftMark))
+        && dbg!(in_predicate_opt.is_some())
+        && dbg!(join_keys_may_be_null(
+            &join_filter,
+            left.schema(),
+            sub_query_alias.schema()
+        )?);
 
     // join our sub query into the main plan
     let new_plan = if null_aware {

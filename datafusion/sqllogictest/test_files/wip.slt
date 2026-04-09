@@ -1,0 +1,34 @@
+statement ok
+CREATE TABLE outer_table(id INT, value TEXT) AS VALUES
+(1, 'a'),
+(2, 'b'),
+(3, 'c'),
+(4, 'd'),
+(NULL, 'e');
+
+statement ok
+CREATE TABLE inner_table_no_null(id INT, value TEXT) AS VALUES
+(2, 'x'),
+(4, 'y');
+
+statement ok
+CREATE TABLE inner_table2(id INT) AS VALUES (1), (3);
+
+query IT rowsort
+SELECT * FROM outer_table
+WHERE id NOT IN (SELECT id FROM inner_table_no_null)
+   OR id NOT IN (SELECT id FROM inner_table2);
+----
+1 a
+2 b
+3 c
+4 d
+
+statement ok
+DROP TABLE inner_table2;
+
+statement ok
+DROP TABLE inner_table_no_null;
+
+statement ok
+DROP TABLE outer_table;
