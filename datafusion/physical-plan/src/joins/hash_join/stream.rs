@@ -43,11 +43,11 @@ use crate::{
         BuildProbeJoinMetrics, ColumnIndex, JoinFilter, JoinHashMapType,
         StatefulStreamResult, adjust_indices_by_join_type, apply_join_filter_to_indices,
         build_batch_empty_build_side, build_batch_from_indices,
-        need_produce_result_in_final,
+        build_null_aware_left_mark_column, need_produce_result_in_final,
     },
 };
 
-use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array};
+use arrow::array::{Array, ArrayRef, UInt32Array, UInt64Array};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{
@@ -641,10 +641,10 @@ impl HashJoinStream {
 
         let timer = self.join_metrics.join_time.timer();
 
-        // Null-aware anti join semantics:
-        // For LeftAnti: output LEFT (build) rows where LEFT.key NOT IN RIGHT.key
-        // 1. If RIGHT (probe) contains NULL in any batch, no LEFT rows should be output
-        // 2. LEFT rows with NULL keys should not be output (handled in final stage)
+        // Null-aware join bookkeeping:
+        // - LeftAnti needs global knowledge of probe-side NULLs/non-emptiness to implement NOT IN.
+        // - LeftMark uses the same probe-side state, but materializes the nullable mark column
+        //   in the final stage from the visited bitmap.
         if self.null_aware {
             // Mark that we've seen a probe batch with actual rows (probe side is non-empty)
             // Only set this if batch has rows - empty batches don't count
@@ -667,11 +667,12 @@ impl HashJoinStream {
                     .store(true, Ordering::Relaxed);
             }
 
-            // If probe side has NULL (detected in this or any other partition), return empty result
-            if build_side
-                .left_data
-                .probe_side_has_null
-                .load(Ordering::Relaxed)
+            // LeftAnti can short-circuit once the probe side contains NULL.
+            if self.join_type == JoinType::LeftAnti
+                && build_side
+                    .left_data
+                    .probe_side_has_null
+                    .load(Ordering::Relaxed)
             {
                 timer.done();
                 self.state = HashJoinStreamState::FetchProbeBatch;
@@ -814,54 +815,6 @@ impl HashJoinStream {
                 (build_side.left_data.batch(), &state.batch, JoinSide::Left)
             };
 
-        let mark_column = if self.null_aware && self.join_type == JoinType::LeftMark {
-            let build_has_nulls = build_side
-                .left_data
-                .build_side_has_nulls
-                .load(Ordering::Relaxed);
-            let build_is_empty = build_side
-                .left_data
-                .build_side_is_empty
-                .load(Ordering::Relaxed);
-
-            // Since null_aware validation ensures single column join, we only check the first column
-            let probe_key_column = &probe_batch.column(0);
-
-            Some(Arc::new(
-                (0..probe_key_column.len())
-                    .map(|idx| {
-                        if right_indices.is_valid(idx) {
-                            Some(true)
-                        } else if probe_key_column.is_valid(idx) && !build_has_nulls {
-                            Some(false)
-                        } else if (probe_key_column.is_valid(idx) && build_has_nulls)
-                            || (probe_key_column.is_null(idx) && !build_is_empty)
-                        {
-                            None
-                        } else if probe_key_column.is_null(idx) && build_is_empty {
-                            Some(false)
-                        } else {
-                            unreachable!("Should cover all cases");
-                        }
-                    })
-                    .collect::<BooleanArray>(),
-            ) as ArrayRef)
-
-            // todo!()
-            // Some(Arc::new(
-            //     right_indices
-            //         .iter()
-            //         .map(|v| match v {
-            //             Some(_) => Some(true),
-            //             None if !build_has_nulls => Some(false),
-            //             None if build_has_nulls => None,
-            //         })
-            //         .collect::<BooleanArray>(),
-            // ))
-        } else {
-            None
-        };
-
         let batch = build_batch_from_indices(
             &self.schema,
             build_batch,
@@ -871,7 +824,7 @@ impl HashJoinStream {
             &self.column_indices,
             join_side,
             self.join_type,
-            mark_column.as_ref(),
+            None,
         )?;
 
         let push_status = self.output_buffer.push_batch(batch)?;
@@ -907,6 +860,7 @@ impl HashJoinStream {
         let timer = self.join_metrics.join_time.timer();
 
         if !need_produce_result_in_final(self.join_type) {
+            timer.done();
             self.state = HashJoinStreamState::Completed;
             return Ok(StatefulStreamResult::Continue);
         }
@@ -916,6 +870,7 @@ impl HashJoinStream {
         // For null-aware anti join, if probe side had NULL, no rows should be output
         // Check shared atomic state to get global knowledge across all partitions
         if self.null_aware
+            && self.join_type == JoinType::LeftAnti
             && build_side
                 .left_data
                 .probe_side_has_null
@@ -925,7 +880,9 @@ impl HashJoinStream {
             self.state = HashJoinStreamState::Completed;
             return Ok(StatefulStreamResult::Continue);
         }
+
         if !build_side.left_data.report_probe_completed() {
+            timer.done();
             self.state = HashJoinStreamState::Completed;
             return Ok(StatefulStreamResult::Continue);
         }
@@ -975,12 +932,32 @@ impl HashJoinStream {
         self.join_metrics.input_batches.add(1);
         self.join_metrics.input_rows.add(left_side.len());
 
-        timer.done();
-
-        self.state = HashJoinStreamState::Completed;
-
         // Push final unmatched indices to output buffer
         if !left_side.is_empty() {
+            let mark_column = if self.null_aware && self.join_type == JoinType::LeftMark {
+                let probe_side_has_null = build_side
+                    .left_data
+                    .probe_side_has_null
+                    .load(Ordering::Relaxed);
+                let probe_side_non_empty = build_side
+                    .left_data
+                    .probe_side_non_empty
+                    .load(Ordering::Relaxed);
+                // Since null_aware validation ensures single column join, we only check the first column.
+                assert_eq!(build_side.left_data.values().len(), 1);
+                let build_key_column = &build_side.left_data.values()[0];
+
+                Some(build_null_aware_left_mark_column(
+                    &left_side,
+                    &right_side,
+                    build_key_column.as_ref(),
+                    probe_side_has_null,
+                    probe_side_non_empty,
+                ))
+            } else {
+                None
+            };
+
             let empty_right_batch = RecordBatch::new_empty(self.right.schema());
             let batch = build_batch_from_indices(
                 &self.schema,
@@ -991,7 +968,7 @@ impl HashJoinStream {
                 &self.column_indices,
                 JoinSide::Left,
                 self.join_type,
-                None,
+                mark_column.as_ref(),
             )?;
             let push_status = self.output_buffer.push_batch(batch)?;
 
@@ -1000,6 +977,9 @@ impl HashJoinStream {
                 self.output_buffer.finish()?;
             }
         }
+
+        timer.done();
+        self.state = HashJoinStreamState::Completed;
 
         Ok(StatefulStreamResult::Continue)
     }

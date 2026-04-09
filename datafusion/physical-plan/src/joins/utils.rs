@@ -1150,7 +1150,8 @@ pub(crate) fn build_batch_from_indices(
 
     for column_index in column_indices {
         let array = if column_index.side == JoinSide::None {
-            // For mark joins, the mark column is a true if the indices is not null, otherwise it will be false
+            // For mark joins, callers can provide a custom mark column. Otherwise,
+            // matched rows are `true` and unmatched rows are `false`.
             match mark_column {
                 Some(mark_col) => Arc::clone(mark_col),
                 None => Arc::new(compute::is_not_null(probe_indices)?),
@@ -1179,6 +1180,61 @@ pub(crate) fn build_batch_from_indices(
         columns.push(array);
     }
     Ok(RecordBatch::try_new(Arc::new(schema.clone()), columns)?)
+}
+
+/// Builds the nullable mark column for a null-aware `LeftMark` join.
+///
+/// This follows the left mark hash join described in Neumann, Leis, and Kemper,
+/// "The Complete Story of Joins (in HyPer)", Section 5.6:
+/// <https://www.cs.cmu.edu/~15721-f24/papers/Story_of_Joins.pdf>
+///
+/// `build_indices` and `probe_indices` are the final aligned indices derived from the
+/// visited bitmap. At this point:
+/// - valid `probe_indices` mean the build row matched at least one probe row, so the mark is `TRUE`
+/// - null `probe_indices` mean the build row was unmatched, so the result depends on SQL
+///   three-valued logic
+///
+/// For the current single-key implementation, unmatched rows are classified as follows:
+/// 1. if the build key is `NULL` and the probe side is non-empty, the mark is `NULL`
+/// 2. if the build key is `NULL` and the probe side is empty, the mark is `FALSE`
+/// 3. if the build key is non-null and the probe side contained a `NULL`, the mark is `NULL`
+/// 4. otherwise, the mark is `FALSE`
+///
+/// This is the helper equivalent of the paper's "null bucket" and `hadNull` handling.
+/// It is intentionally scoped to the current single-key null-aware implementation.
+pub(crate) fn build_null_aware_left_mark_column(
+    build_indices: &UInt64Array,
+    probe_indices: &UInt32Array,
+    build_key_column: &dyn Array,
+    probe_side_has_null: bool,
+    probe_side_non_empty: bool,
+) -> ArrayRef {
+    Arc::new(
+        build_indices
+            .iter()
+            .enumerate()
+            .map(|(output_idx, build_idx)| {
+                if probe_indices.is_valid(output_idx) {
+                    Some(true)
+                } else {
+                    let build_idx = build_idx.expect(
+                        "LeftMark final indices should always contain build-side rows",
+                    ) as usize;
+                    if build_key_column.is_null(build_idx) {
+                        if probe_side_non_empty {
+                            None
+                        } else {
+                            Some(false)
+                        }
+                    } else if probe_side_has_null {
+                        None
+                    } else {
+                        Some(false)
+                    }
+                }
+            })
+            .collect::<BooleanArray>(),
+    ) as ArrayRef
 }
 
 /// Returns a new [RecordBatch] resulting of a join where the build/left side is empty.

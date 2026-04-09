@@ -379,6 +379,8 @@ fn build_join(
         .values()
         .for_each(|cols| all_correlated_cols.extend(cols.clone()));
 
+    let has_correlated_join_filter = !pull_up.join_filters.is_empty();
+
     // alias the join filter
     let join_filter_opt = conjunction(pull_up.join_filters)
         .map_or(Ok(None), |filter| {
@@ -448,9 +450,27 @@ fn build_join(
             sub_query_alias.clone()
         };
 
-        // Mark joins don't use null-aware semantics (they use three-valued logic with mark column)
+        // For simple uncorrelated NOT IN disjunctions, propagate null-aware semantics into the
+        // nullable mark column. Correlated mark joins still use the legacy path because the
+        // runtime state is global to the probe side rather than per-left-row.
+        let null_aware = join_type == JoinType::LeftMark
+            && in_predicate_opt.is_some()
+            && !has_correlated_join_filter
+            && join_keys_may_be_null(
+                &join_filter,
+                left.schema(),
+                right_projected.schema(),
+            )?;
+
         let new_plan = LogicalPlanBuilder::from(left.clone())
-            .join_on(right_projected, join_type, Some(join_filter))?
+            .join_detailed_with_options(
+                right_projected,
+                join_type,
+                (Vec::<Column>::new(), Vec::<Column>::new()),
+                Some(join_filter),
+                NullEquality::NullEqualsNothing,
+                null_aware,
+            )?
             .build()?;
 
         debug!(
@@ -469,13 +489,9 @@ fn build_join(
     //
     // Additionally, if the join keys are non-nullable on both sides, we don't need
     // null-aware semantics because NULLs cannot exist in the data.
-    let null_aware = dbg!(matches!(join_type, JoinType::LeftAnti | JoinType::LeftMark))
-        && dbg!(in_predicate_opt.is_some())
-        && dbg!(join_keys_may_be_null(
-            &join_filter,
-            left.schema(),
-            sub_query_alias.schema()
-        )?);
+    let null_aware = matches!(join_type, JoinType::LeftAnti)
+        && in_predicate_opt.is_some()
+        && join_keys_may_be_null(&join_filter, left.schema(), sub_query_alias.schema())?;
 
     // join our sub query into the main plan
     let new_plan = if null_aware {
@@ -1748,6 +1764,7 @@ mod tests {
             plan,
             @r"
         Projection: customer.c_custkey [c_custkey:Int64]
+<<<<<<< HEAD
           Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
             Filter: __correlated_sq_1.mark OR customer.c_custkey = Int32(1) [c_custkey:Int64, c_name:Utf8, mark:Boolean]
               LeftMark Join:  Filter: Boolean(true) [c_custkey:Int64, c_name:Utf8, mark:Boolean]
@@ -1756,6 +1773,15 @@ mod tests {
                   Projection: orders.o_custkey [o_custkey:Int64]
                     Filter: customer.c_custkey = orders.o_custkey [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
                       TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+=======
+          Filter: __correlated_sq_1.mark OR customer.c_custkey = Int32(1) [c_custkey:Int64, c_name:Utf8, mark:Boolean;N]
+            LeftMark Join:  Filter: Boolean(true) [c_custkey:Int64, c_name:Utf8, mark:Boolean;N]
+              TableScan: customer [c_custkey:Int64, c_name:Utf8]
+              SubqueryAlias: __correlated_sq_1 [o_custkey:Int64]
+                Projection: orders.o_custkey [o_custkey:Int64]
+                  Filter: customer.c_custkey = orders.o_custkey [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+                    TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+>>>>>>> a2889a658 (step 2)
         "
         )
     }

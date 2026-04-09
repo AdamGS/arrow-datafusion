@@ -214,12 +214,8 @@ pub(super) struct JoinLeftData {
     /// Shared atomic flag indicating if any probe partition saw data (for null-aware anti/mark joins)
     /// This is shared across all probe partitions to provide global knowledge
     pub(super) probe_side_non_empty: AtomicBool,
-    /// Shared atomic flag indicating if any probe partition saw NULL in join keys (for null-aware anti joins)
+    /// Shared atomic flag indicating if any probe partition saw NULL in join keys
     pub(super) probe_side_has_null: AtomicBool,
-    /// Shared atomic flag indicating if any build partition saw NULL in join keys (for null-aware mark joins)
-    pub(super) build_side_has_nulls: AtomicBool,
-    /// Not sure how to use this yet
-    pub(super) build_side_is_empty: AtomicBool,
 }
 
 impl JoinLeftData {
@@ -408,15 +404,15 @@ impl HashJoinExecBuilder {
         // Validate null_aware flag
         if exec.null_aware {
             let join_type = exec.join_type();
-            if !matches!(join_type, JoinType::LeftAnti) {
+            if !matches!(join_type, JoinType::LeftAnti | JoinType::LeftMark) {
                 return plan_err!(
-                    "null_aware can only be true for LeftAnti joins, got {join_type}"
+                    "null_aware can only be true for LeftAnti or LeftMark joins, got {join_type}"
                 );
             }
             let on = exec.on();
             if on.len() != 1 {
                 return plan_err!(
-                    "null_aware anti join only supports single column join key, got {} columns",
+                    "null_aware joins only support single column join key, got {} columns",
                     on.len()
                 );
             }
@@ -2067,9 +2063,6 @@ async fn collect_left_input(
         bounds = None;
     }
 
-    let build_side_has_nulls = batch.columns().iter().any(|col| col.null_count() > 0);
-    let build_side_is_empty = batch.num_rows() == 0;
-
     let data = JoinLeftData {
         map,
         batch,
@@ -2081,8 +2074,6 @@ async fn collect_left_input(
         membership,
         probe_side_non_empty: AtomicBool::new(false),
         probe_side_has_null: AtomicBool::new(false),
-        build_side_has_nulls: AtomicBool::new(build_side_has_nulls),
-        build_side_is_empty: AtomicBool::new(build_side_is_empty),
     };
 
     Ok(data)
@@ -6223,7 +6214,7 @@ mod tests {
         Ok(())
     }
 
-    /// Test that null_aware validation rejects non-LeftAnti join types
+    /// Test that null_aware validation rejects unsupported join types
     #[tokio::test]
     async fn test_null_aware_validation_wrong_join_type() {
         let left =
@@ -6254,7 +6245,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("null_aware can only be true for LeftAnti joins")
+                .contains("null_aware can only be true for LeftAnti or LeftMark joins")
         );
     }
 
@@ -6294,8 +6285,114 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("null_aware anti join only supports single column join key")
+                .contains("null_aware joins only support single column join key")
         );
+    }
+
+    /// Test null-aware left mark join when probe side contains NULL.
+    /// Expected:
+    /// - matched rows => true
+    /// - unmatched non-NULL rows => NULL
+    /// - NULL build keys with non-empty probe side => NULL
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_left_mark_probe_null(batch_size: usize) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_two_cols(
+            ("c1", &vec![Some(1), Some(4), None]),
+            ("dummy", &vec![Some(10), Some(40), Some(0)]),
+        );
+
+        let right = build_table_two_cols(
+            ("c2", &vec![Some(1), Some(2), None]),
+            ("dummy", &vec![Some(100), Some(200), Some(300)]),
+        );
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("c1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("c2", &right.schema())?) as _,
+        )];
+
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::LeftMark,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            true, // null_aware = true
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+-------+------+
+            | c1 | dummy | mark |
+            +----+-------+------+
+            |    | 0     |      |
+            | 1  | 10    | true |
+            | 4  | 40    |      |
+            +----+-------+------+
+            ");
+        }
+
+        Ok(())
+    }
+
+    /// Test null-aware left mark join when probe side is empty.
+    /// Expected: all rows are marked false, including NULL build keys.
+    #[apply(hash_join_exec_configs)]
+    #[tokio::test]
+    async fn test_null_aware_left_mark_empty_probe(batch_size: usize) -> Result<()> {
+        let task_ctx = prepare_task_ctx(batch_size, false);
+
+        let left = build_table_two_cols(
+            ("c1", &vec![Some(1), None]),
+            ("dummy", &vec![Some(10), Some(0)]),
+        );
+
+        let right = build_table_two_cols(
+            ("c2", &Vec::<Option<i32>>::new()),
+            ("dummy", &Vec::<Option<i32>>::new()),
+        );
+
+        let on = vec![(
+            Arc::new(Column::new_with_schema("c1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("c2", &right.schema())?) as _,
+        )];
+
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::LeftMark,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            true, // null_aware = true
+        )?;
+
+        let stream = join.execute(0, task_ctx)?;
+        let batches = common::collect(stream).await?;
+
+        allow_duplicates! {
+            assert_snapshot!(batches_to_sort_string(&batches), @r"
+            +----+-------+-------+
+            | c1 | dummy | mark  |
+            +----+-------+-------+
+            |    | 0     | false |
+            | 1  | 10    | false |
+            +----+-------+-------+
+            ");
+        }
+
+        Ok(())
     }
 
     #[test]
