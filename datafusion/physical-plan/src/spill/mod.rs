@@ -731,7 +731,6 @@ mod tests {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn test_spill_compression() -> Result<()> {
         let batch = build_compressible_batch();

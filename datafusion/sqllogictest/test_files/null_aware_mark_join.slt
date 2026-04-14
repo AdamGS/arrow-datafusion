@@ -175,7 +175,8 @@ physical_plan
 
 ###################################
 ## Sort-merge join null-aware mark
-As of this work, sort-merge join actually don't support null-aware semantics, so they still end up using a hash-join.
+# As of this work, sort-merge join actually don't support null-aware semantics, 
+# so they still end up using a hash-join.
 ###################################
 
 statement ok
