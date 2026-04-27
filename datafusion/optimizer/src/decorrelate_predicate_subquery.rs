@@ -1764,24 +1764,14 @@ mod tests {
             plan,
             @r"
         Projection: customer.c_custkey [c_custkey:Int64]
-<<<<<<< HEAD
           Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
-            Filter: __correlated_sq_1.mark OR customer.c_custkey = Int32(1) [c_custkey:Int64, c_name:Utf8, mark:Boolean]
-              LeftMark Join:  Filter: Boolean(true) [c_custkey:Int64, c_name:Utf8, mark:Boolean]
+            Filter: __correlated_sq_1.mark OR customer.c_custkey = Int32(1) [c_custkey:Int64, c_name:Utf8, mark:Boolean;N]
+              LeftMark Join:  Filter: Boolean(true) [c_custkey:Int64, c_name:Utf8, mark:Boolean;N]
                 TableScan: customer [c_custkey:Int64, c_name:Utf8]
                 SubqueryAlias: __correlated_sq_1 [o_custkey:Int64]
                   Projection: orders.o_custkey [o_custkey:Int64]
                     Filter: customer.c_custkey = orders.o_custkey [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
                       TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
-=======
-          Filter: __correlated_sq_1.mark OR customer.c_custkey = Int32(1) [c_custkey:Int64, c_name:Utf8, mark:Boolean;N]
-            LeftMark Join:  Filter: Boolean(true) [c_custkey:Int64, c_name:Utf8, mark:Boolean;N]
-              TableScan: customer [c_custkey:Int64, c_name:Utf8]
-              SubqueryAlias: __correlated_sq_1 [o_custkey:Int64]
-                Projection: orders.o_custkey [o_custkey:Int64]
-                  Filter: customer.c_custkey = orders.o_custkey [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
-                    TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
->>>>>>> a2889a658 (step 2)
         "
         )
     }
