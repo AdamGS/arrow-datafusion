@@ -196,6 +196,8 @@ pub(super) struct JoinLeftData {
     values: Vec<ArrayRef>,
     /// Shared bitmap builder for visited left indices
     visited_indices_bitmap: SharedBitmapBuilder,
+    /// Shared bitmap builder for null marks
+    null_indices_bitmap: SharedBitmapBuilder,
     /// Counter of running probe-threads, potentially
     /// able to update `visited_indices_bitmap`
     probe_threads_counter: AtomicUsize,
@@ -2019,16 +2021,18 @@ async fn collect_left_input(
         };
 
     // Reserve additional memory for visited indices bitmap and create shared builder
-    let visited_indices_bitmap = if with_visited_indices_bitmap {
+    let (visited_indices_bitmap, null_indices_bitmap) = if with_visited_indices_bitmap {
         let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
-        reservation.try_grow(bitmap_size)?;
-        metrics.build_mem_used.add(bitmap_size);
+        reservation.try_grow(bitmap_size * 2)?;
+        metrics.build_mem_used.add(bitmap_size * 2);
 
-        let mut bitmap_buffer = BooleanBufferBuilder::new(batch.num_rows());
-        bitmap_buffer.append_n(num_rows, false);
-        bitmap_buffer
+        let mut visited = BooleanBufferBuilder::new(batch.num_rows());
+        let mut nulls = BooleanBufferBuilder::new(batch.num_rows());
+        visited.append_n(num_rows, false);
+        nulls.append_n(num_rows, false);
+        (visited, nulls)
     } else {
-        BooleanBufferBuilder::new(0)
+        (BooleanBufferBuilder::new(0), BooleanBufferBuilder::new(0))
     };
 
     let map = Arc::new(join_hash_map);
@@ -2068,6 +2072,7 @@ async fn collect_left_input(
         batch,
         values: left_values,
         visited_indices_bitmap: Mutex::new(visited_indices_bitmap),
+        null_indices_bitmap: Mutex::new(null_indices_bitmap),
         probe_threads_counter: AtomicUsize::new(probe_threads_count),
         _reservation: reservation,
         bounds,
