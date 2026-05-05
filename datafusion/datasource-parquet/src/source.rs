@@ -981,8 +981,6 @@ mod tests {
 
         let source = ParquetSource::new(table_schema).with_pushdown_filters(true);
 
-        // Three filters: pure file-col (pushable), pure virtual (not pushable),
-        // and a mixed OR conjunct (not pushable).
         let full_schema = source.table_schema.table_schema();
 
         let pushable = logical2physical(&col("value").eq(logical_lit(1i64)), full_schema);

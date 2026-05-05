@@ -259,9 +259,7 @@ impl TableSchema {
         if self.virtual_columns.is_empty() {
             return Arc::clone(&self.table_schema);
         }
-        let mut builder = SchemaBuilder::from(self.file_schema.as_ref());
-        builder.extend(self.table_partition_cols.iter().cloned());
-        Arc::new(builder.finish())
+        build_table_schema(&self.file_schema, &self.table_partition_cols, &[])
     }
 }
 

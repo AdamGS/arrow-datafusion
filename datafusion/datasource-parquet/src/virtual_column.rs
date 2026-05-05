@@ -17,29 +17,21 @@
 
 //! Typed wrapper for parquet virtual columns.
 //!
-//! arrow-rs identifies virtual columns (produced by the reader, not read from
-//! the file) via arrow extension types carried on the `FieldRef`. This module
-//! lifts that contract into the type system: [`ParquetVirtualColumn`] is the
-//! set of virtual columns DataFusion currently supports, and its
-//! [`TryFrom<FieldRef>`] impl validates the extension type at the boundary so
-//! downstream code can pattern-match on variants rather than string-compare.
+//! arrow-rs identifies virtual columns via arrow extension types carried on
+//! the `FieldRef`. [`ParquetVirtualColumn`] lifts that contract into the type
+//! system so callers validate at the boundary (via `TryFrom<&FieldRef>`)
+//! rather than string-comparing extension-type names deep inside the reader.
 
 use arrow::datatypes::FieldRef;
 use arrow_schema::extension::ExtensionType;
 use datafusion_common::{DataFusionError, Result, not_impl_err};
 use parquet::arrow::RowNumber;
+use std::sync::Arc;
 
 /// A parquet virtual column validated to have a supported arrow extension
 /// type.
 ///
-/// Virtual columns are synthesized by the parquet reader (e.g.
-/// [`RowNumber`] produces the absolute row number within the file) rather
-/// than being read from column data. Because arrow-rs identifies them via
-/// extension types on `FieldRef`, it would be easy to pass an unsupported or
-/// misspelled extension type and have the error surface deep in the reader
-/// pipeline; this enum forces the check to the construction boundary.
-///
-/// Construct via [`TryFrom<FieldRef>`]; add a new variant (and update the
+/// Construct via [`TryFrom<&FieldRef>`]; add a new variant (and update the
 /// `TryFrom` impl) when DataFusion gains support for another arrow-rs virtual
 /// extension type.
 #[derive(Debug, Clone)]
@@ -50,9 +42,6 @@ pub enum ParquetVirtualColumn {
 }
 
 impl ParquetVirtualColumn {
-    /// The underlying arrow field, with its extension type and metadata
-    /// preserved. Suitable for passing to
-    /// `ArrowReaderOptions::with_virtual_columns`.
     pub fn field(&self) -> &FieldRef {
         match self {
             Self::RowNumber(field) => field,
@@ -68,10 +57,10 @@ impl From<ParquetVirtualColumn> for FieldRef {
     }
 }
 
-impl TryFrom<FieldRef> for ParquetVirtualColumn {
+impl TryFrom<&FieldRef> for ParquetVirtualColumn {
     type Error = DataFusionError;
 
-    fn try_from(field: FieldRef) -> Result<Self> {
+    fn try_from(field: &FieldRef) -> Result<Self> {
         let Some(name) = field.extension_type_name() else {
             return not_impl_err!(
                 "Virtual column '{}' is missing an Arrow extension type; \
@@ -81,7 +70,7 @@ impl TryFrom<FieldRef> for ParquetVirtualColumn {
             );
         };
         match name {
-            n if n == RowNumber::NAME => Ok(Self::RowNumber(field)),
+            n if n == RowNumber::NAME => Ok(Self::RowNumber(Arc::clone(field))),
             other => not_impl_err!(
                 "Virtual column '{}' uses unsupported Arrow extension type '{}'; \
                  supported types: [{}]. Add a ParquetVirtualColumn variant and \
@@ -98,7 +87,6 @@ impl TryFrom<FieldRef> for ParquetVirtualColumn {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field};
-    use std::sync::Arc;
 
     #[test]
     fn row_number_field_converts() {
@@ -106,8 +94,7 @@ mod tests {
             Field::new("row_number", DataType::Int64, false)
                 .with_extension_type(RowNumber),
         );
-        let col =
-            ParquetVirtualColumn::try_from(Arc::clone(&field)).expect("valid row_number");
+        let col = ParquetVirtualColumn::try_from(&field).expect("valid row_number");
         assert!(matches!(col, ParquetVirtualColumn::RowNumber(_)));
         assert_eq!(col.field().name(), "row_number");
     }
@@ -115,11 +102,10 @@ mod tests {
     #[test]
     fn missing_extension_type_rejected() {
         let field: FieldRef = Arc::new(Field::new("plain", DataType::Int64, false));
-        let err = ParquetVirtualColumn::try_from(field).unwrap_err();
-        let msg = err.to_string();
+        let err = ParquetVirtualColumn::try_from(&field).unwrap_err();
         assert!(
-            msg.contains("missing an Arrow extension type"),
-            "got: {msg}"
+            err.to_string().contains("missing an Arrow extension type"),
+            "got: {err}"
         );
     }
 
@@ -130,11 +116,10 @@ mod tests {
             Field::new("row_group_index", DataType::Int64, false)
                 .with_extension_type(parquet::arrow::RowGroupIndex),
         );
-        let err = ParquetVirtualColumn::try_from(field).unwrap_err();
-        let msg = err.to_string();
+        let err = ParquetVirtualColumn::try_from(&field).unwrap_err();
         assert!(
-            msg.contains("parquet.virtual.row_group_index"),
-            "error should name the offending extension type, got: {msg}"
+            err.to_string().contains("parquet.virtual.row_group_index"),
+            "error should name the offending extension type, got: {err}"
         );
     }
 }
