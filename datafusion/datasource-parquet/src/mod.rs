@@ -36,6 +36,7 @@ mod row_group_filter;
 mod sort;
 pub mod source;
 mod supported_predicates;
+mod virtual_column;
 mod writer;
 
 pub use access_plan::{ParquetAccessPlan, RowGroupAccess};
@@ -46,4 +47,5 @@ pub use reader::*; // Expose so downstream crates can use it
 pub use row_filter::build_row_filter;
 pub use row_filter::can_expr_be_pushed_down_with_schemas;
 pub use row_group_filter::RowGroupAccessPlanFilter;
+pub use virtual_column::ParquetVirtualColumn;
 pub use writer::plan_to_parquet;

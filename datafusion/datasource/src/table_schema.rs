@@ -77,6 +77,10 @@ pub struct TableSchema {
     /// values are produced per file by the reader. Virtual column fields must
     /// carry an arrow extension type (e.g. `RowNumber`, `RowGroupIndex`) so the
     /// file reader can recognize them.
+    ///
+    /// Virtual columns are appended at the end of the table schema, after the
+    /// file columns and any partition columns (layout: `[file, partition,
+    /// virtual]`).
     virtual_columns: Arc<Vec<FieldRef>>,
 
     /// Columns that are derived from the directory structure (partitioning scheme).
@@ -237,6 +241,27 @@ impl TableSchema {
     /// in the order: file columns, partition columns, virtual columns.
     pub fn table_schema(&self) -> &SchemaRef {
         &self.table_schema
+    }
+
+    /// Schema of columns that can be referenced by predicates pushed into the
+    /// file reader: file columns plus partition columns, excluding virtual
+    /// columns.
+    ///
+    /// Virtual columns are produced by the reader itself (e.g. Parquet
+    /// `row_number`) and cannot be referenced inside the reader's row filter,
+    /// so predicates that reference them must stay above the scan. Callers
+    /// deciding which filters to push down should check against this schema
+    /// rather than [`Self::table_schema`].
+    ///
+    /// When there are no virtual columns this returns the same schema as
+    /// [`Self::table_schema`].
+    pub fn schema_without_virtual_columns(&self) -> SchemaRef {
+        if self.virtual_columns.is_empty() {
+            return Arc::clone(&self.table_schema);
+        }
+        let mut builder = SchemaBuilder::from(self.file_schema.as_ref());
+        builder.extend(self.table_partition_cols.iter().cloned());
+        Arc::new(builder.finish())
     }
 }
 

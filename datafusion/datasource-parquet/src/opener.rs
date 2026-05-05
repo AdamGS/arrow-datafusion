@@ -22,7 +22,8 @@ use crate::row_filter::build_projection_read_plan;
 use crate::row_group_filter::{BloomFilterStatistics, RowGroupAccessPlanFilter};
 use crate::{
     ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
-    apply_file_schema_type_coercions, coerce_int96_to_resolution, row_filter,
+    ParquetVirtualColumn, apply_file_schema_type_coercions, coerce_int96_to_resolution,
+    row_filter,
 };
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::datatypes::DataType;
@@ -39,14 +40,15 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow::datatypes::{FieldRef, Schema, SchemaRef, TimeUnit};
-use arrow_schema::extension::ExtensionType;
 use datafusion_common::encryption::FileDecryptionProperties;
 use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     ColumnStatistics, DataFusionError, Result, ScalarValue, Statistics, exec_err,
     not_impl_err,
 };
 use datafusion_datasource::{PartitionedFile, TableSchema};
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::{
@@ -68,7 +70,6 @@ use futures::{
 use log::debug;
 use parquet::DecodeResult;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
-use parquet::arrow::RowNumber;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, RowSelectionPolicy,
@@ -543,6 +544,14 @@ impl ParquetMorselizer {
         partitioned_file: PartitionedFile,
     ) -> Result<PreparedParquetOpen> {
         validate_supported_virtual_columns(self.table_schema.virtual_columns())?;
+        if self.pushdown_filters
+            && let Some(predicate) = self.predicate.as_ref()
+        {
+            validate_predicate_does_not_reference_virtual_columns(
+                predicate,
+                self.table_schema.virtual_columns(),
+            )?;
+        }
         let file_range = partitioned_file.range.clone();
         let extensions = partitioned_file.extensions.clone();
         let file_name = partitioned_file.object_meta.location.to_string();
@@ -1381,14 +1390,6 @@ impl PushDecoderStreamState {
 
 type ConstantColumns = HashMap<String, ScalarValue>;
 
-/// Allowlist of Arrow extension types for Parquet virtual columns that this
-/// opener is tested against. Only add entries here when a corresponding
-/// end-to-end test exists in `mod test::virtual_columns`; arrow-rs may expose
-/// additional virtual extension types over time, and silently forwarding
-/// untested ones risks producing columns that don't round-trip through
-/// DataFusion's predicate and projection paths as expected.
-const SUPPORTED_VIRTUAL_EXTENSION_TYPES: &[&str] = &[RowNumber::NAME];
-
 /// Return `base` unchanged when `extra` is empty; otherwise build a new schema
 /// with `extra` appended to `base`'s fields.
 fn append_fields(base: &SchemaRef, extra: &[FieldRef]) -> SchemaRef {
@@ -1404,26 +1405,65 @@ fn append_fields(base: &SchemaRef, extra: &[FieldRef]) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
+/// Validate that each field is a DataFusion-supported parquet virtual column
+/// by round-tripping it through [`ParquetVirtualColumn::try_from`]. Adding a
+/// new supported extension type means adding a variant there — not editing a
+/// stringly-typed allowlist here.
 fn validate_supported_virtual_columns(virtual_columns: &[FieldRef]) -> Result<()> {
     for field in virtual_columns {
-        let Some(name) = field.extension_type_name() else {
-            return not_impl_err!(
-                "Virtual column '{}' is missing an Arrow extension type; \
-                 virtual columns must carry one of: {:?}",
-                field.name(),
-                SUPPORTED_VIRTUAL_EXTENSION_TYPES
-            );
-        };
-        if !SUPPORTED_VIRTUAL_EXTENSION_TYPES.contains(&name) {
-            return not_impl_err!(
-                "Virtual column '{}' uses unsupported Arrow extension type '{}'; \
-                 supported types: {:?}. Add the extension type to \
-                 SUPPORTED_VIRTUAL_EXTENSION_TYPES together with a test covering it.",
-                field.name(),
-                name,
-                SUPPORTED_VIRTUAL_EXTENSION_TYPES
-            );
+        ParquetVirtualColumn::try_from(Arc::clone(field))?;
+    }
+    Ok(())
+}
+
+/// Reject predicates that reference a virtual column when filter pushdown is
+/// enabled.
+///
+/// arrow-rs's `RowFilter` evaluates predicates against a `ProjectionMask` that
+/// addresses parquet leaves only; virtual columns (e.g. `row_number`) are
+/// synthesized by the reader *after* filter evaluation and cannot be referenced
+/// inside a row filter. Silently dropping such a predicate would produce wrong
+/// results, so we fail loudly here.
+///
+/// Callers constructing a `ParquetSource` should rely on
+/// `FileSource::try_pushdown_filters` (invoked by the `FilterPushdown` physical
+/// optimizer rule) to classify filters correctly: filters referencing virtual
+/// columns are reported as `PushedDown::No` and stay in the enclosing
+/// `FilterExec`, while the scan emits the virtual columns for the filter to
+/// consume. Callers building plans manually must keep the `FilterExec` above
+/// the `DataSourceExec` themselves rather than setting the predicate on
+/// `ParquetSource` with pushdown enabled.
+fn validate_predicate_does_not_reference_virtual_columns(
+    predicate: &Arc<dyn PhysicalExpr>,
+    virtual_columns: &[FieldRef],
+) -> Result<()> {
+    if virtual_columns.is_empty() {
+        return Ok(());
+    }
+    let mut offender: Option<String> = None;
+    predicate.apply(|node: &Arc<dyn PhysicalExpr>| {
+        if let Some(column) = node.downcast_ref::<Column>()
+            && virtual_columns
+                .iter()
+                .any(|f| f.name().as_str() == column.name())
+        {
+            offender = Some(column.name().to_string());
+            return Ok(TreeNodeRecursion::Stop);
         }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    if let Some(name) = offender {
+        return not_impl_err!(
+            "Predicate references virtual column '{name}' while \
+             pushdown_filters=true. DataFusion cannot push predicates on \
+             virtual columns into the Parquet reader: arrow-rs's RowFilter \
+             operates on a ProjectionMask over file leaves, and virtual \
+             columns (e.g. row_number) are synthesized by the reader after \
+             filter evaluation. Either leave the filter in a FilterExec above \
+             the scan (this is what `ParquetSource::try_pushdown_filters` / \
+             the FilterPushdown optimizer rule will do automatically), or \
+             disable pushdown via `with_pushdown_filters(false)`."
+        );
     }
     Ok(())
 }
@@ -3176,6 +3216,124 @@ mod test {
                 msg.contains("parquet.virtual.row_group_index"),
                 "error should name the unsupported extension type, got: {msg}"
             );
+        }
+
+        #[tokio::test]
+        async fn test_row_index_predicate_pushdown_mixed_or_errors() {
+            // Mixed `row_number = 2 OR value = 4` with pushdown_filters=true.
+            // Silently dropping this in the scan would return all 5 rows; we
+            // instead surface a guidance-rich error so callers realize the
+            // predicate needs to stay above the scan.
+            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let (file_schema, data_size) =
+                write_grouped_file(&store, "pushdown_mixed.parquet", 1, 5).await;
+
+            let rn_field = row_number_field("row_number", false);
+            let table_schema = TableSchema::from_file_schema(Arc::clone(&file_schema))
+                .with_virtual_columns(vec![Arc::clone(&rn_field)]);
+            let projection =
+                ProjectionExprs::from_indices(&[0, 1], table_schema.table_schema());
+
+            let expr = col("row_number")
+                .eq(lit(2i64))
+                .or(col("value").eq(lit(4i64)));
+            let predicate = logical2physical(&expr, table_schema.table_schema());
+
+            let morselizer = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_table_schema(table_schema)
+                .with_projection(projection)
+                .with_predicate(predicate)
+                .with_pushdown_filters(true)
+                .build();
+
+            let file = PartitionedFile::new(
+                "pushdown_mixed.parquet".to_string(),
+                u64::try_from(data_size).unwrap(),
+            );
+            let err = morselizer.plan_file(file).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("row_number"),
+                "error should name the offending virtual column, got: {msg}"
+            );
+            assert!(
+                msg.contains("arrow-rs") && msg.contains("RowFilter"),
+                "error should explain the arrow-rs limitation, got: {msg}"
+            );
+            assert!(
+                msg.contains("FilterExec")
+                    || msg.contains("FilterPushdown")
+                    || msg.contains("try_pushdown_filters"),
+                "error should point at the correct API path, got: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_row_index_predicate_pushdown_virtual_only_errors() {
+            // Predicate referencing only a virtual column with pushdown_filters=true.
+            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let (file_schema, data_size) =
+                write_grouped_file(&store, "pushdown_virtual_only.parquet", 1, 5).await;
+
+            let rn_field = row_number_field("row_number", false);
+            let table_schema = TableSchema::from_file_schema(Arc::clone(&file_schema))
+                .with_virtual_columns(vec![Arc::clone(&rn_field)]);
+            let projection =
+                ProjectionExprs::from_indices(&[0, 1], table_schema.table_schema());
+
+            let expr = col("row_number").eq(lit(2i64));
+            let predicate = logical2physical(&expr, table_schema.table_schema());
+
+            let morselizer = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_table_schema(table_schema)
+                .with_projection(projection)
+                .with_predicate(predicate)
+                .with_pushdown_filters(true)
+                .build();
+
+            let file = PartitionedFile::new(
+                "pushdown_virtual_only.parquet".to_string(),
+                u64::try_from(data_size).unwrap(),
+            );
+            let err = morselizer.plan_file(file).unwrap_err();
+            assert!(err.to_string().contains("row_number"));
+        }
+
+        #[tokio::test]
+        async fn test_row_index_predicate_allowed_when_pushdown_disabled() {
+            // Same predicate, but pushdown_filters=false. The predicate is only
+            // used for stats pruning (which is a no-op for row_number) and must
+            // NOT error.
+            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let (file_schema, data_size) =
+                write_grouped_file(&store, "pushdown_off.parquet", 1, 5).await;
+
+            let rn_field = row_number_field("row_number", false);
+            let table_schema = TableSchema::from_file_schema(Arc::clone(&file_schema))
+                .with_virtual_columns(vec![Arc::clone(&rn_field)]);
+            let projection =
+                ProjectionExprs::from_indices(&[0, 1], table_schema.table_schema());
+
+            let expr = col("row_number").eq(lit(2i64));
+            let predicate = logical2physical(&expr, table_schema.table_schema());
+
+            let morselizer = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_table_schema(table_schema)
+                .with_projection(projection)
+                .with_predicate(predicate)
+                .build(); // pushdown_filters defaults to false
+
+            let file = PartitionedFile::new(
+                "pushdown_off.parquet".to_string(),
+                u64::try_from(data_size).unwrap(),
+            );
+            // Should open cleanly and return all rows (no row filter applied).
+            let stream = open_file(&morselizer, file).await.unwrap();
+            let (_batches, rows) = count_batches_and_rows(stream).await;
+            assert_eq!(rows, 5);
         }
     }
 }
