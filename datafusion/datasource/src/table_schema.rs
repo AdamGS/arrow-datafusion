@@ -167,6 +167,12 @@ impl TableSchema {
     /// into [`TableSchema::with_table_partition_cols`] if you have partition columns at construction time
     /// since it avoids re-computing the table schema.
     pub fn with_table_partition_cols(mut self, partition_cols: Vec<FieldRef>) -> Self {
+        debug_assert!(
+            !partition_cols
+                .iter()
+                .any(|p| self.virtual_columns.iter().any(|v| v.name() == p.name())),
+            "partition column name collides with an existing virtual column"
+        );
         if self.table_partition_cols.is_empty() {
             self.table_partition_cols = Arc::new(partition_cols);
         } else {
@@ -195,6 +201,17 @@ impl TableSchema {
     /// Virtual columns are appended at the end of the table schema, after any
     /// partition columns.
     pub fn with_virtual_columns(mut self, virtual_columns: Vec<FieldRef>) -> Self {
+        debug_assert!(
+            virtual_columns.iter().enumerate().all(|(i, v)| {
+                let name = v.name();
+                !self.file_schema.fields().iter().any(|f| f.name() == name)
+                    && !self.table_partition_cols.iter().any(|p| p.name() == name)
+                    && !self.virtual_columns.iter().any(|w| w.name() == name)
+                    && !virtual_columns[..i].iter().any(|w| w.name() == name)
+            }),
+            "virtual column name collides with an existing file, partition, or virtual column"
+        );
+
         if self.virtual_columns.is_empty() {
             self.virtual_columns = Arc::new(virtual_columns);
         } else {
@@ -408,5 +425,74 @@ mod tests {
             assert_eq!(ts.table_partition_cols().len(), 1);
             assert_eq!(ts.file_schema().fields().len(), 2);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "virtual column name collides")]
+    #[cfg(debug_assertions)]
+    fn test_virtual_column_collides_with_file_schema_panics_in_debug() {
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "row_number",
+            DataType::Int64,
+            false,
+        )]));
+        let _ = TableSchema::from_file_schema(file_schema).with_virtual_columns(vec![
+            Arc::new(Field::new("row_number", DataType::Int64, true)),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "virtual column name collides")]
+    #[cfg(debug_assertions)]
+    fn test_virtual_column_collides_with_partition_panics_in_debug() {
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "user_id",
+            DataType::Int64,
+            false,
+        )]));
+        let partition_cols =
+            vec![Arc::new(Field::new("row_number", DataType::Utf8, false))];
+        let _ = TableSchema::new(file_schema, partition_cols).with_virtual_columns(vec![
+            Arc::new(Field::new("row_number", DataType::Int64, true)),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "virtual column name collides")]
+    #[cfg(debug_assertions)]
+    fn test_duplicate_virtual_columns_panic_in_debug() {
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "user_id",
+            DataType::Int64,
+            false,
+        )]));
+        let _ = TableSchema::from_file_schema(file_schema).with_virtual_columns(vec![
+            Arc::new(Field::new("vc", DataType::Int64, true)),
+            Arc::new(Field::new("vc", DataType::Int64, true)),
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "partition column name collides")]
+    #[cfg(debug_assertions)]
+    fn test_partition_column_added_after_colliding_virtual_panics_in_debug() {
+        // Guards the ordering hole: with_virtual_columns then
+        // with_table_partition_cols must not silently reintroduce a collision.
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "user_id",
+            DataType::Int64,
+            false,
+        )]));
+        let _ = TableSchema::from_file_schema(file_schema)
+            .with_virtual_columns(vec![Arc::new(Field::new(
+                "row_number",
+                DataType::Int64,
+                true,
+            ))])
+            .with_table_partition_cols(vec![Arc::new(Field::new(
+                "row_number",
+                DataType::Utf8,
+                false,
+            ))]);
     }
 }
