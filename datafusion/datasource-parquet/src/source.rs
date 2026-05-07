@@ -24,6 +24,7 @@ use crate::DefaultParquetFileReaderFactory;
 use crate::ParquetFileReaderFactory;
 use crate::opener::ParquetMorselizer;
 use crate::opener::build_pruning_predicates;
+use crate::opener::build_virtual_columns_state;
 use crate::row_filter::can_expr_be_pushed_down_with_schemas;
 use datafusion_common::config::ConfigOptions;
 #[cfg(feature = "parquet_encryption")]
@@ -553,6 +554,22 @@ impl FileSource for ParquetSource {
             .as_ref()
             .map(|time_unit| parse_coerce_int96_string(time_unit.as_str()).unwrap());
 
+        // Validate virtual columns (extension-type allowlist) and, when
+        // pushdown is enabled, reject predicates that reference them. Both
+        // checks depend only on morselizer-level state, so we pay their cost
+        // once per scan partition rather than per file.
+        //
+        // Gating predicate validation on `pushdown_filters` is deliberate:
+        // when pushdown is off the predicate stays above the scan as a
+        // `FilterExec` and resolves virtual columns there; the row-filter
+        // ban only applies to the pushdown path.
+        let virtual_state = build_virtual_columns_state(
+            self.table_schema.virtual_columns(),
+            self.table_schema.file_schema(),
+            self.predicate.as_ref(),
+            self.pushdown_filters(),
+        )?;
+
         Ok(Box::new(ParquetMorselizer {
             partition_index: partition,
             projection: self.projection.clone(),
@@ -580,6 +597,7 @@ impl FileSource for ParquetSource {
             encryption_factory: self.get_encryption_factory_with_config(),
             max_predicate_cache_size: self.max_predicate_cache_size(),
             reverse_row_groups: self.reverse_row_groups,
+            virtual_state,
         }))
     }
 

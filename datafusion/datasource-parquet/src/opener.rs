@@ -81,6 +81,81 @@ use parquet::basic::Type;
 use parquet::bloom_filter::Sbbf;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 
+/// Morselizer-level state for virtual columns, precomputed once per scan
+/// partition so each file skips the validator walks, `null_replacements`
+/// rebuild, and one of the `append_fields` allocations.
+///
+/// Only constructed when the scan actually requests virtual columns;
+/// [`ParquetMorselizer`] and [`PreparedParquetOpen`] hold
+/// `Option<Arc<VirtualColumnsState>>` so the zero-virtual-column path (the
+/// common case) pays nothing.
+pub(crate) struct VirtualColumnsState {
+    /// Shared list of virtual column fields. Cloned as a `Vec` only at the
+    /// arrow-rs `with_virtual_columns` call site, which takes it by value.
+    virtual_columns: Arc<Vec<FieldRef>>,
+    /// Null-literal substitutions keyed by virtual column name, used to strip
+    /// virtual-column references from the projection fed into
+    /// `build_projection_read_plan` (which only understands file columns).
+    null_replacements: HashMap<String, ScalarValue>,
+    /// `logical_file_schema` with the virtual columns appended. Fed into the
+    /// per-file expression rewriter so virtual-column references
+    /// identity-rewrite instead of being replaced with null literals.
+    logical_schema_with_virtual: SchemaRef,
+}
+
+impl VirtualColumnsState {
+    /// Validate each field carries a supported arrow virtual extension type
+    /// and precompute the per-scan derived state.
+    fn try_new(
+        virtual_columns: Vec<FieldRef>,
+        logical_file_schema: &SchemaRef,
+    ) -> Result<Self> {
+        // Gate which extension types we forward to arrow-rs. Adding a new
+        // supported virtual column means adding a `ParquetVirtualColumn`
+        // variant — not editing a stringly-typed allowlist here.
+        for field in &virtual_columns {
+            ParquetVirtualColumn::try_from(field)?;
+        }
+        let null_replacements = virtual_columns
+            .iter()
+            .map(|f| ScalarValue::try_from(f.data_type()).map(|v| (f.name().clone(), v)))
+            .collect::<Result<HashMap<String, ScalarValue>>>()?;
+        let logical_schema_with_virtual =
+            append_fields(logical_file_schema, &virtual_columns);
+        Ok(Self {
+            virtual_columns: Arc::new(virtual_columns),
+            null_replacements,
+            logical_schema_with_virtual,
+        })
+    }
+}
+
+/// Build the per-scan virtual-column state, running all morselizer-level
+/// validation (both the extension-type check and, when pushdown is enabled,
+/// the predicate-reference check).
+///
+/// Returns `None` when the scan has no virtual columns, so callers avoid
+/// allocating the shared state on the common path.
+pub(crate) fn build_virtual_columns_state(
+    virtual_columns: &[FieldRef],
+    logical_file_schema: &SchemaRef,
+    predicate: Option<&Arc<dyn PhysicalExpr>>,
+    pushdown_filters: bool,
+) -> Result<Option<Arc<VirtualColumnsState>>> {
+    if virtual_columns.is_empty() {
+        return Ok(None);
+    }
+    if pushdown_filters && let Some(predicate) = predicate {
+        validate_predicate_does_not_reference_virtual_columns(
+            predicate,
+            virtual_columns,
+        )?;
+    }
+    let state =
+        VirtualColumnsState::try_new(virtual_columns.to_vec(), logical_file_schema)?;
+    Ok(Some(Arc::new(state)))
+}
+
 /// Stateless Parquet morselizer implementation.
 ///
 /// Reading a Parquet file is a multi-stage process, with multiple CPU-intensive
@@ -140,6 +215,9 @@ pub(super) struct ParquetMorselizer {
     pub max_predicate_cache_size: Option<usize>,
     /// Whether to read row groups in reverse order
     pub reverse_row_groups: bool,
+    /// Per-scan virtual-column state (validation already performed). `None`
+    /// when no virtual columns are requested — the common path.
+    pub(crate) virtual_state: Option<Arc<VirtualColumnsState>>,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -278,10 +356,11 @@ struct PreparedParquetOpen {
     output_schema: SchemaRef,
     projection: ProjectionExprs,
     predicate: Option<Arc<dyn PhysicalExpr>>,
-    /// Virtual columns (e.g. parquet `row_number`) to be produced by the reader
-    /// in addition to the file's own columns. Empty when no virtual columns
-    /// were requested by the caller.
-    virtual_columns: Vec<FieldRef>,
+    /// Per-scan virtual-column state, Arc-cloned from [`ParquetMorselizer`] so
+    /// each file shares validated fields, precomputed null replacements, and
+    /// the logical-with-virtual schema. `None` when no virtual columns were
+    /// requested.
+    virtual_state: Option<Arc<VirtualColumnsState>>,
     reorder_predicates: bool,
     pushdown_filters: bool,
     force_filter_selections: bool,
@@ -543,15 +622,6 @@ impl ParquetMorselizer {
         &self,
         partitioned_file: PartitionedFile,
     ) -> Result<PreparedParquetOpen> {
-        validate_supported_virtual_columns(self.table_schema.virtual_columns())?;
-        if self.pushdown_filters
-            && let Some(predicate) = self.predicate.as_ref()
-        {
-            validate_predicate_does_not_reference_virtual_columns(
-                predicate,
-                self.table_schema.virtual_columns(),
-            )?;
-        }
         let file_range = partitioned_file.range.clone();
         let extensions = partitioned_file.extensions.clone();
         let file_name = partitioned_file.object_meta.location.to_string();
@@ -660,7 +730,7 @@ impl ParquetMorselizer {
             output_schema,
             projection,
             predicate,
-            virtual_columns: self.table_schema.virtual_columns().clone(),
+            virtual_state: self.virtual_state.as_ref().map(Arc::clone),
             reorder_predicates: self.reorder_filters,
             pushdown_filters: self.pushdown_filters,
             force_filter_selections: self.force_filter_selections,
@@ -808,8 +878,8 @@ impl MetadataLoadedParquetOpen {
 
         // Arrow-rs appends virtual columns to the supplied schema internally,
         // so any `with_schema` coercion above must stay limited to file columns.
-        if !prepared.virtual_columns.is_empty() {
-            options = options.with_virtual_columns(prepared.virtual_columns.clone())?;
+        if let Some(state) = prepared.virtual_state.as_ref() {
+            options = options.with_virtual_columns((*state.virtual_columns).clone())?;
             metadata_dirty = true;
         }
 
@@ -845,10 +915,18 @@ impl MetadataLoadedParquetOpen {
             // expression trees. We keep `physical_file_schema` itself as the
             // pure file schema so downstream predicate pushdown, pruning, and
             // row filter construction stay unaffected.
-            let logical_for_rewrite =
-                append_fields(&prepared.logical_file_schema, &prepared.virtual_columns);
-            let physical_for_rewrite =
-                append_fields(&physical_file_schema, &prepared.virtual_columns);
+            let (logical_for_rewrite, physical_for_rewrite) =
+                if let Some(state) = prepared.virtual_state.as_ref() {
+                    (
+                        Arc::clone(&state.logical_schema_with_virtual),
+                        append_fields(&physical_file_schema, &state.virtual_columns),
+                    )
+                } else {
+                    (
+                        Arc::clone(&prepared.logical_file_schema),
+                        Arc::clone(&physical_file_schema),
+                    )
+                };
             let rewriter = prepared.expr_adapter_factory.create(
                 Arc::clone(&logical_for_rewrite),
                 Arc::clone(&physical_for_rewrite),
@@ -1181,19 +1259,11 @@ impl RowGroupsPrunedParquetOpen {
         // reference with a null literal; that leaves the remaining Column
         // refs (into `physical_file_schema`) intact for
         // `ProjectionMask::roots`, which only understands file columns.
-        let projection_for_read_plan = if prepared.virtual_columns.is_empty() {
-            prepared.projection.clone()
-        } else {
-            let null_replacements = prepared
-                .virtual_columns
-                .iter()
-                .map(|f| {
-                    ScalarValue::try_from(f.data_type()).map(|v| (f.name().clone(), v))
-                })
-                .collect::<Result<HashMap<String, ScalarValue>>>()?;
-            prepared.projection.clone().try_map_exprs(|expr| {
-                replace_columns_with_literals(expr, &null_replacements)
-            })?
+        let projection_for_read_plan = match prepared.virtual_state.as_ref() {
+            None => prepared.projection.clone(),
+            Some(state) => prepared.projection.clone().try_map_exprs(|expr| {
+                replace_columns_with_literals(expr, &state.null_replacements)
+            })?,
         };
 
         let read_plan = build_projection_read_plan(
@@ -1240,8 +1310,12 @@ impl RowGroupsPrunedParquetOpen {
         // The reader produces projected file columns followed by any virtual
         // columns (`ArrowReaderOptions::with_virtual_columns` appends them to
         // each decoded batch).
-        let stream_schema =
-            append_fields(&read_plan.projected_schema, &prepared.virtual_columns);
+        let stream_schema = match prepared.virtual_state.as_ref() {
+            Some(state) => {
+                append_fields(&read_plan.projected_schema, &state.virtual_columns)
+            }
+            None => Arc::clone(&read_plan.projected_schema),
+        };
         let replace_schema = stream_schema != prepared.output_schema;
 
         // Rebase column indices to match the narrowed stream schema.
@@ -1403,17 +1477,6 @@ fn append_fields(base: &SchemaRef, extra: &[FieldRef]) -> SchemaRef {
         .chain(extra.iter().cloned())
         .collect::<Vec<_>>();
     Arc::new(Schema::new(fields))
-}
-
-/// Validate that each field is a DataFusion-supported parquet virtual column
-/// by round-tripping it through [`ParquetVirtualColumn::try_from`]. Adding a
-/// new supported extension type means adding a variant there — not editing a
-/// stringly-typed allowlist here.
-fn validate_supported_virtual_columns(virtual_columns: &[FieldRef]) -> Result<()> {
-    for field in virtual_columns {
-        ParquetVirtualColumn::try_from(field)?;
-    }
-    Ok(())
 }
 
 /// Reject predicates that reference a virtual column when filter pushdown is
@@ -1918,12 +1981,26 @@ mod test {
             self
         }
 
-        /// Build the ParquetMorselizer instance.
+        /// Build the ParquetMorselizer instance, unwrapping validation errors.
+        ///
+        /// # Panics
+        ///
+        /// Panics if required fields (store, schema/table_schema) are not set,
+        /// or if virtual-column validation fails. Use [`Self::try_build`]
+        /// when the test wants to assert on the validation error.
+        fn build(self) -> ParquetMorselizer {
+            self.try_build().expect("ParquetMorselizerBuilder::build")
+        }
+
+        /// Build the ParquetMorselizer instance, returning any morselizer-level
+        /// validation error (e.g. unsupported virtual extension type, or a
+        /// predicate that references a virtual column with
+        /// `pushdown_filters=true`).
         ///
         /// # Panics
         ///
         /// Panics if required fields (store, schema/table_schema) are not set.
-        fn build(self) -> ParquetMorselizer {
+        fn try_build(self) -> Result<ParquetMorselizer> {
             let store = self
                 .store
                 .expect("ParquetMorselizerBuilder: store must be set via with_store()");
@@ -1942,7 +2019,14 @@ mod test {
                 ProjectionExprs::from_indices(&all_indices, &file_schema)
             };
 
-            ParquetMorselizer {
+            let virtual_state = build_virtual_columns_state(
+                table_schema.virtual_columns(),
+                table_schema.file_schema(),
+                self.predicate.as_ref(),
+                self.pushdown_filters,
+            )?;
+
+            Ok(ParquetMorselizer {
                 partition_index: self.partition_index,
                 projection,
                 batch_size: self.batch_size,
@@ -1969,7 +2053,8 @@ mod test {
                 encryption_factory: None,
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
-            }
+                virtual_state,
+            })
         }
     }
 
@@ -3178,7 +3263,7 @@ mod test {
             // we have not validated against DataFusion's projection and
             // predicate paths).
             let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-            let (file_schema, data_size) =
+            let (file_schema, _data_size) =
                 write_grouped_file(&store, "unsupported.parquet", 1, 1).await;
 
             // RowGroupIndex is a real arrow-rs virtual type but is not in
@@ -3192,17 +3277,14 @@ mod test {
             let projection =
                 ProjectionExprs::from_indices(&[0, 1], table_schema.table_schema());
 
-            let morselizer = ParquetMorselizerBuilder::new()
+            // Validation now happens at morselizer-build time (once per scan
+            // partition), not once per file inside `prepare_open_file`.
+            let err = ParquetMorselizerBuilder::new()
                 .with_store(Arc::clone(&store))
                 .with_table_schema(table_schema)
                 .with_projection(projection)
-                .build();
-            let file = PartitionedFile::new(
-                "unsupported.parquet".to_string(),
-                u64::try_from(data_size).unwrap(),
-            );
-
-            let err = morselizer.plan_file(file).unwrap_err();
+                .try_build()
+                .unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("parquet.virtual.row_group_index"),
@@ -3214,12 +3296,16 @@ mod test {
         /// `path`, with a single `row_number` virtual column and the given
         /// physical predicate applied to
         /// `table_schema = [value(0), row_number(1)]`.
+        ///
+        /// Returns `Err` when morselizer-build validation rejects the
+        /// predicate (pushdown + virtual-column reference); returns `Ok`
+        /// otherwise.
         async fn build_pushdown_morselizer(
             store: &Arc<dyn ObjectStore>,
             path: &str,
             predicate_expr: datafusion_expr::Expr,
             pushdown_filters: bool,
-        ) -> (ParquetMorselizer, PartitionedFile) {
+        ) -> Result<(ParquetMorselizer, PartitionedFile)> {
             let (file_schema, data_size) = write_grouped_file(store, path, 1, 5).await;
             let rn_field = row_number_field("row_number", false);
             let table_schema = TableSchema::from_file_schema(Arc::clone(&file_schema))
@@ -3235,11 +3321,11 @@ mod test {
                 .with_projection(projection)
                 .with_predicate(predicate)
                 .with_pushdown_filters(pushdown_filters)
-                .build();
+                .try_build()?;
 
             let file =
                 PartitionedFile::new(path.to_string(), u64::try_from(data_size).unwrap());
-            (morselizer, file)
+            Ok((morselizer, file))
         }
 
         #[tokio::test]
@@ -3250,11 +3336,10 @@ mod test {
             let expr = col("row_number")
                 .eq(lit(2i64))
                 .or(col("value").eq(lit(4i64)));
-            let (morselizer, file) =
+            let err =
                 build_pushdown_morselizer(&store, "pushdown_mixed.parquet", expr, true)
-                    .await;
-
-            let err = morselizer.plan_file(file).unwrap_err();
+                    .await
+                    .unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("row_number"),
@@ -3271,15 +3356,14 @@ mod test {
         async fn test_row_index_predicate_pushdown_virtual_only_errors() {
             let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
             let expr = col("row_number").eq(lit(2i64));
-            let (morselizer, file) = build_pushdown_morselizer(
+            let err = build_pushdown_morselizer(
                 &store,
                 "pushdown_virtual_only.parquet",
                 expr,
                 true,
             )
-            .await;
-
-            let err = morselizer.plan_file(file).unwrap_err();
+            .await
+            .unwrap_err();
             assert!(err.to_string().contains("row_number"));
         }
 
@@ -3292,7 +3376,8 @@ mod test {
             let expr = col("row_number").eq(lit(2i64));
             let (morselizer, file) =
                 build_pushdown_morselizer(&store, "pushdown_off.parquet", expr, false)
-                    .await;
+                    .await
+                    .unwrap();
 
             let stream = open_file(&morselizer, file).await.unwrap();
             let (_batches, rows) = count_batches_and_rows(stream).await;
