@@ -45,7 +45,7 @@ use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     ColumnStatistics, DataFusionError, HashSet, Result, ScalarValue, Statistics,
-    exec_err, not_impl_err,
+    exec_err, internal_err,
 };
 use datafusion_datasource::{PartitionedFile, TableSchema};
 use datafusion_physical_expr::expressions::Column;
@@ -130,9 +130,17 @@ impl VirtualColumnsState {
     }
 }
 
-/// Build the per-scan virtual-column state, running all morselizer-level
-/// validation (both the extension-type check and, when pushdown is enabled,
-/// the predicate-reference check).
+/// Build the per-scan virtual-column state.
+///
+/// Two checks run here, with different runtime behavior:
+/// - Extension-type allowlist (always on, via [`VirtualColumnsState::try_new`]):
+///   returns `Err` for unsupported virtual extension types.
+/// - Predicate-reference check (debug builds only, when pushdown is enabled):
+///   panics via [`validate_predicate_does_not_reference_virtual_columns`].
+///   The contract is that callers route filters through
+///   [`ParquetSource::try_pushdown_filters`], which classifies virtual-col
+///   filters as `PushedDown::No`. Release builds trust the contract; the
+///   assert is a dev/CI safety net.
 ///
 /// Returns `None` when the scan has no virtual columns, so callers avoid
 /// allocating the shared state on the common path.
@@ -145,11 +153,18 @@ pub(crate) fn build_virtual_columns_state(
     if virtual_columns.is_empty() {
         return Ok(None);
     }
-    if pushdown_filters && let Some(predicate) = predicate {
-        validate_predicate_does_not_reference_virtual_columns(
+    if cfg!(debug_assertions)
+        && pushdown_filters
+        && let Some(predicate) = predicate
+        && let Err(e) = validate_predicate_does_not_reference_virtual_columns(
             predicate,
             virtual_columns,
-        )?;
+        )
+    {
+        panic!(
+            "{e} Route filters through ParquetSource::try_pushdown_filters; \
+             the opener trusts that filters reaching it are file-column only."
+        );
     }
     let state =
         VirtualColumnsState::try_new(virtual_columns.to_vec(), logical_file_schema)?;
@@ -1479,20 +1494,15 @@ fn append_fields(base: &SchemaRef, extra: &[FieldRef]) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// Reject predicates that reference a virtual column when filter pushdown is
-/// enabled.
+/// Reject predicates that reference a virtual column.
 ///
 /// arrow-rs's `RowFilter` evaluates predicates against a `ProjectionMask` that
 /// addresses parquet leaves only; virtual columns (e.g. `row_number`) are
 /// synthesized by the reader *after* filter evaluation and cannot be referenced
 /// inside a row filter. Silently dropping such a predicate would produce wrong
-/// results, so we fail loudly here.
+/// results.
 ///
-/// `ParquetSource::try_pushdown_filters` already classifies virtual-column
-/// filters as `PushedDown::No` so the `FilterPushdown` optimizer leaves them
-/// above the scan; this check is defense-in-depth for callers that build plans
-/// manually and set `with_pushdown_filters(true)` alongside a predicate
-/// referencing virtual columns.
+/// Returns `Result` so the same check can be reused outside the debug assert.
 fn validate_predicate_does_not_reference_virtual_columns(
     predicate: &Arc<dyn PhysicalExpr>,
     virtual_columns: &[FieldRef],
@@ -1513,11 +1523,9 @@ fn validate_predicate_does_not_reference_virtual_columns(
         Ok(TreeNodeRecursion::Continue)
     })?;
     if let Some(name) = offender {
-        return not_impl_err!(
-            "Predicate references virtual column '{name}' while \
-             pushdown_filters=true; predicates on virtual columns must be \
-             evaluated above the scan. Disable filter pushdown or leave the \
-             filter above the scan."
+        return internal_err!(
+            "Predicate references virtual column '{name}' but virtual-column \
+             refs must be evaluated above the scan."
         );
     }
     Ok(())
@@ -3290,10 +3298,6 @@ mod test {
         /// `path`, with a single `row_number` virtual column and the given
         /// physical predicate applied to
         /// `table_schema = [value(0), row_number(1)]`.
-        ///
-        /// Returns `Err` when morselizer-build validation rejects the
-        /// predicate (pushdown + virtual-column reference); returns `Ok`
-        /// otherwise.
         async fn build_pushdown_morselizer(
             store: &Arc<dyn ObjectStore>,
             path: &str,
@@ -3322,50 +3326,44 @@ mod test {
             Ok((morselizer, file))
         }
 
+        // The predicate-vs-virtual-column check is a debug-only assert: the
+        // contract is that `ParquetSource::try_pushdown_filters` keeps
+        // virtual-col filters above the scan, and release builds trust it.
+        // These two `#[should_panic]` tests pin the dev/CI safety net; they
+        // can only fire when `debug_assertions` is on.
+        #[cfg(debug_assertions)]
         #[tokio::test]
-        async fn test_row_index_predicate_pushdown_mixed_or_errors() {
-            // Silent drop in the scan would return all 5 rows; we want a loud
-            // error instead.
+        #[should_panic(expected = "try_pushdown_filters")]
+        async fn test_row_index_predicate_pushdown_mixed_or_panics_in_debug() {
             let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
             let expr = col("row_number")
                 .eq(lit(2i64))
                 .or(col("value").eq(lit(4i64)));
-            let err =
+            let _ =
                 build_pushdown_morselizer(&store, "pushdown_mixed.parquet", expr, true)
-                    .await
-                    .unwrap_err();
-            let msg = err.to_string();
-            assert!(
-                msg.contains("row_number"),
-                "error should name the offending virtual column, got: {msg}"
-            );
-            assert!(
-                msg.contains("virtual column") && msg.contains("pushdown"),
-                "error should explain the virtual-column + pushdown context, \
-                 got: {msg}"
-            );
+                    .await;
         }
 
+        #[cfg(debug_assertions)]
         #[tokio::test]
-        async fn test_row_index_predicate_pushdown_virtual_only_errors() {
+        #[should_panic(expected = "try_pushdown_filters")]
+        async fn test_row_index_predicate_pushdown_virtual_only_panics_in_debug() {
             let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
             let expr = col("row_number").eq(lit(2i64));
-            let err = build_pushdown_morselizer(
+            let _ = build_pushdown_morselizer(
                 &store,
                 "pushdown_virtual_only.parquet",
                 expr,
                 true,
             )
-            .await
-            .unwrap_err();
-            assert!(err.to_string().contains("row_number"));
+            .await;
         }
 
         #[tokio::test]
         async fn test_row_index_predicate_allowed_when_pushdown_disabled() {
             // Guards the `pushdown_filters=false` path: the predicate is only
             // used for stats pruning (a no-op for row_number) and must not
-            // trip the pushdown-guard error.
+            // trip the debug assert.
             let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
             let expr = col("row_number").eq(lit(2i64));
             let (morselizer, file) =
