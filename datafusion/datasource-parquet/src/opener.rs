@@ -1524,8 +1524,8 @@ fn validate_predicate_does_not_reference_virtual_columns(
     })?;
     if let Some(name) = offender {
         return internal_err!(
-            "Predicate references virtual column '{name}' but virtual-column \
-             refs must be evaluated above the scan."
+            "Predicate references virtual column '{name}'; route via \
+             ParquetSource::try_pushdown_filters."
         );
     }
     Ok(())

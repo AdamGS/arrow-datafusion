@@ -343,7 +343,11 @@ impl ParquetSource {
         self
     }
 
-    /// Set predicate information
+    /// Set predicate information.
+    ///
+    /// Predicates referencing virtual columns must go through
+    /// [`Self::try_pushdown_filters`]. Passing them here with pushdown
+    /// enabled trips a debug assert in the opener.
     #[expect(clippy::needless_pass_by_value)]
     pub fn with_predicate(&self, predicate: Arc<dyn PhysicalExpr>) -> Self {
         let mut conf = self.clone();
