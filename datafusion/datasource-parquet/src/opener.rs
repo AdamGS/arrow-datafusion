@@ -138,7 +138,7 @@ impl VirtualColumnsState {
 /// - Predicate-reference check (debug builds only, when pushdown is enabled):
 ///   panics via [`validate_predicate_does_not_reference_virtual_columns`].
 ///   The contract is that callers route filters through
-///   [`ParquetSource::try_pushdown_filters`], which classifies virtual-col
+///   [`ParquetSource::try_pushdown_filters`](crate::source::ParquetSource::try_pushdown_filters), which classifies virtual-col
 ///   filters as `PushedDown::No`. Release builds trust the contract; the
 ///   assert is a dev/CI safety net.
 ///
