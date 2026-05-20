@@ -47,6 +47,18 @@ CREATE TABLE inner_corr_table(id INT, grp INT) AS VALUES
 (NULL, 1),
 (1, 2);
 
+# Out-of-scope row-valued NOT IN repro kept for future work.
+# DuckDB issue #19182 covers partially NULL tuple comparison semantics; this PR
+# only targets scalar null-aware mark joins.
+# statement ok
+# CREATE TABLE outer_tuple_table(f1 INT, f2 INT) AS VALUES
+# (0, 0),
+# (1, 0);
+#
+# statement ok
+# CREATE TABLE inner_tuple_table(c1 BIGINT, c2 BIGINT) AS VALUES
+# (0, NULL);
+
 statement ok
 CREATE TABLE empty_table(id INT) AS
 SELECT *
@@ -148,6 +160,31 @@ WHERE (id NOT IN (
 a
 b
 d
+
+# Regression test for row-valued NOT IN with a partially NULL tuple.
+# This matches DuckDB issue #19182 and the Postgres-style behavior from
+# https://github.com/duckdb/duckdb/pull/22683. It is commented out because
+# tuple-valued NOT IN needs row-comparison NULL semantics that are outside this
+# scalar null-aware mark join PR.
+# query II rowsort
+# SELECT f1, f2
+# FROM outer_tuple_table
+# WHERE (f1, f2) NOT IN (
+#   SELECT c1, c2
+#   FROM inner_tuple_table
+# );
+# ----
+# 1 0
+#
+# query II rowsort
+# SELECT f1, f2
+# FROM outer_tuple_table
+# WHERE ((f1, f2) NOT IN (
+#   SELECT c1, c2
+#   FROM inner_tuple_table
+# )) IS NULL;
+# ----
+# 0 0
 
 # These queries would fall back to a sort-merge, but we force them
 # into hash joins to make sure we null awareness.
@@ -289,6 +326,12 @@ DROP TABLE inner_corr_table;
 
 statement ok
 DROP TABLE outer_corr_table;
+
+# statement ok
+# DROP TABLE inner_tuple_table;
+#
+# statement ok
+# DROP TABLE outer_tuple_table;
 
 statement ok
 DROP TABLE outer_table;

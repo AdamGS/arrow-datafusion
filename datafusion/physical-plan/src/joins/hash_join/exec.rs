@@ -190,6 +190,8 @@ pub(super) struct JoinLeftData {
     /// The hash table with indices into `batch`
     /// Arc is used to allow sharing with SharedBuildAccumulator for hash map pushdown
     pub(super) map: Arc<Map>,
+
+    null_aware_mark_scope_map: Option<Arc<Map>>,
     /// The input rows for the build side
     batch: RecordBatch,
     /// The build side on expressions values
@@ -216,7 +218,7 @@ pub(super) struct JoinLeftData {
     /// Shared atomic flag indicating if any probe partition saw data (for null-aware anti/mark joins)
     /// This is shared across all probe partitions to provide global knowledge
     pub(super) probe_side_non_empty: AtomicBool,
-    /// Shared atomic flag indicating if any probe partition saw NULL in join keys
+    /// Shared atomic flag indicating if any probe partition saw NULL in join keys (for null-aware anti joins)
     pub(super) probe_side_has_null: AtomicBool,
 }
 
@@ -224,6 +226,10 @@ impl JoinLeftData {
     /// return a reference to the map
     pub(super) fn map(&self) -> &Map {
         &self.map
+    }
+
+    pub(super) fn null_aware_mark_scope_map(&self) -> Option<&Map> {
+        self.null_aware_mark_scope_map.as_deref()
     }
 
     /// returns a reference to the build side batch
@@ -239,6 +245,10 @@ impl JoinLeftData {
     /// returns a reference to the visited indices bitmap
     pub(super) fn visited_indices_bitmap(&self) -> &SharedBitmapBuilder {
         &self.visited_indices_bitmap
+    }
+
+    pub(super) fn null_indices_bitmap(&self) -> &SharedBitmapBuilder {
+        &self.null_indices_bitmap
     }
 
     /// returns a reference to the InList values for filter pushdown
@@ -1868,6 +1878,7 @@ fn should_collect_min_max_for_perfect_hash(
 /// * `with_visited_indices_bitmap` - Whether to track visited indices (for outer joins)
 /// * `probe_threads_count` - Number of threads that will probe this hash table
 /// * `should_compute_dynamic_filters` - Whether to compute min/max bounds for dynamic filtering
+/// * `with_null_indices_bitmap` - Whether to track null indices (for nul aware mark joins)
 ///
 /// # Dynamic Filter Coordination
 /// When `should_compute_dynamic_filters` is true, this function computes the min/max bounds
@@ -1892,6 +1903,8 @@ async fn collect_left_input(
     config: Arc<ConfigOptions>,
     null_equality: NullEquality,
     array_map_created_count: Count,
+    with_null_indices_bitmap: bool,
+    with_null_aware_mark_scope_map: bool,
 ) -> Result<JoinLeftData> {
     let schema = left_stream.schema();
 
@@ -2020,19 +2033,27 @@ async fn collect_left_input(
             (Map::HashMap(hashmap), batch, left_values)
         };
 
-    // Reserve additional memory for visited indices bitmap and create shared builder
-    let (visited_indices_bitmap, null_indices_bitmap) = if with_visited_indices_bitmap {
+    let allocate_bitmap = || -> Result<BooleanBufferBuilder> {
         let bitmap_size = bit_util::ceil(batch.num_rows(), 8);
-        reservation.try_grow(bitmap_size * 2)?;
-        metrics.build_mem_used.add(bitmap_size * 2);
+        reservation.try_grow(bitmap_size)?;
+        metrics.build_mem_used.add(bitmap_size);
 
-        let mut visited = BooleanBufferBuilder::new(batch.num_rows());
-        let mut nulls = BooleanBufferBuilder::new(batch.num_rows());
-        visited.append_n(num_rows, false);
-        nulls.append_n(num_rows, false);
-        (visited, nulls)
+        let mut bitmap = BooleanBufferBuilder::new(batch.num_rows());
+        bitmap.append_n(num_rows, false);
+        Ok(bitmap)
+    };
+
+    // Reserve additional memory for visited indices bitmap and create shared builder
+    let visited_indices_bitmap = if with_visited_indices_bitmap {
+        allocate_bitmap()?
     } else {
-        (BooleanBufferBuilder::new(0), BooleanBufferBuilder::new(0))
+        BooleanBufferBuilder::new(0)
+    };
+
+    let null_indices_bitmap = if with_null_indices_bitmap {
+        allocate_bitmap()?
+    } else {
+        BooleanBufferBuilder::new(0)
     };
 
     let map = Arc::new(join_hash_map);

@@ -226,6 +226,11 @@ pub(super) struct HashJoinStream {
     probe_indices_buffer: Vec<u32>,
     /// Scratch space for build indices during hash lookup
     build_indices_buffer: Vec<u64>,
+
+    null_mark_hashes_buffer: Vec<u64>,
+    null_mark_probe_indices_buffer: Vec<u32>,
+    null_mark_build_indices_buffer: Vec<u64>,
+
     /// Specifies whether the right side has an ordering to potentially preserve
     right_side_ordered: bool,
     /// Shared build accumulator for coordinating dynamic filter updates (collects hash maps and/or bounds, optional)
@@ -413,6 +418,9 @@ impl HashJoinStream {
             hashes_buffer,
             probe_indices_buffer: Vec::with_capacity(batch_size),
             build_indices_buffer: Vec::with_capacity(batch_size),
+            null_mark_hashes_buffer: Vec::with_capacity(batch_size),
+            null_mark_probe_indices_buffer: Vec::with_capacity(batch_size),
+            null_mark_build_indices_buffer: Vec::with_capacity(batch_size),
             right_side_ordered,
             build_accumulator,
             build_waiter: None,
@@ -702,6 +710,14 @@ impl HashJoinStream {
             return Ok(StatefulStreamResult::Continue);
         }
 
+        if self.null_aware
+            && self.join_type == JoinType::LeftMark
+            && state.values.len() > 1
+            && state.offset == (0, None)
+        {
+            mark_null_candidates_for_probe_batch(build_side, &state);
+        }
+
         // get the matched by join keys indices
         let (left_indices, right_indices, next_offset) = match build_side.left_data.map()
         {
@@ -983,6 +999,19 @@ impl HashJoinStream {
 
         Ok(StatefulStreamResult::Continue)
     }
+}
+
+fn mark_null_candidates_for_probe_batch(
+    build_side: &mut BuildSideReadyState,
+    state: &ProcessProbeBatchState,
+) {
+    let Some(null_aware_mark_scope_map) =
+        build_side.left_data.null_aware_mark_scope_map()
+    else {
+        return;
+    };
+
+    todo!()
 }
 
 impl Stream for HashJoinStream {
