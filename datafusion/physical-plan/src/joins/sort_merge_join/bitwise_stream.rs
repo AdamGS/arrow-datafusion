@@ -125,9 +125,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::joins::utils::{
-    JoinFilter, JoinKeyComparator, build_null_aware_left_mark_column, compare_join_arrays,
-};
+use crate::joins::utils::{JoinFilter, JoinKeyComparator, compare_join_arrays};
 use crate::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder,
 };

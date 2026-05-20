@@ -39,7 +39,9 @@ CREATE TABLE outer_corr_table(id INT, grp INT, value TEXT) AS VALUES
 (3, 1, 'b'),
 (1, 2, 'c'),
 (NULL, 1, 'd'),
-(5, 3, 'e');
+(5, 3, 'e'),
+(2, 1, 'f'),
+(NULL, 2, 'g');
 
 statement ok
 CREATE TABLE inner_corr_table(id INT, grp INT) AS VALUES
@@ -160,6 +162,18 @@ WHERE (id NOT IN (
 a
 b
 d
+g
+
+query T rowsort
+SELECT value
+FROM outer_corr_table
+WHERE (id NOT IN (
+  SELECT id
+  FROM inner_corr_table
+  WHERE inner_corr_table.grp = outer_corr_table.grp
+)) IS TRUE;
+----
+e
 
 # Regression test for row-valued NOT IN with a partially NULL tuple.
 # This matches DuckDB issue #19182 and the Postgres-style behavior from

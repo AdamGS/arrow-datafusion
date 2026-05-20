@@ -1194,18 +1194,22 @@ pub(crate) fn build_batch_from_indices(
 /// - null `probe_indices` mean the build row was unmatched, so the result depends on SQL
 ///   three-valued logic
 ///
-/// For the current single-key implementation, unmatched rows are classified as follows:
+/// For the uncorrelated single-key implementation, unmatched rows are classified as follows:
 /// 1. if the build key is `NULL` and the probe side is non-empty, the mark is `NULL`
 /// 2. if the build key is `NULL` and the probe side is empty, the mark is `FALSE`
 /// 3. if the build key is non-null and the probe side contained a `NULL`, the mark is `NULL`
 /// 4. otherwise, the mark is `FALSE`
 ///
+/// For correlated scalar `NOT IN`, `null_indices_bitmap` carries the same UNKNOWN
+/// decision per build row, scoped by the correlated equality keys.
+///
 /// This is the helper equivalent of the paper's "null bucket" and `hadNull` handling.
-/// It is intentionally scoped to the current single-key null-aware implementation.
+/// It is intentionally scoped to scalar null-aware mark joins.
 pub(crate) fn build_null_aware_left_mark_column(
     build_indices: &UInt64Array,
     probe_indices: &UInt32Array,
     build_key_column: &dyn Array,
+    null_indices_bitmap: Option<&BooleanBufferBuilder>,
     probe_side_has_null: bool,
     probe_side_non_empty: bool,
 ) -> ArrayRef {
@@ -1220,7 +1224,13 @@ pub(crate) fn build_null_aware_left_mark_column(
                     let build_idx = build_idx.expect(
                         "LeftMark final indices should always contain build-side rows",
                     ) as usize;
-                    if build_key_column.is_null(build_idx) {
+                    if let Some(null_indices_bitmap) = null_indices_bitmap {
+                        if null_indices_bitmap.get_bit(build_idx) {
+                            None
+                        } else {
+                            Some(false)
+                        }
+                    } else if build_key_column.is_null(build_idx) {
                         if probe_side_non_empty {
                             None
                         } else {
