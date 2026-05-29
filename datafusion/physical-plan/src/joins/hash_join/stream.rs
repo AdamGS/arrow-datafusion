@@ -979,7 +979,7 @@ impl HashJoinStream {
                     &left_side,
                     &right_side,
                     build_key_column.as_ref(),
-                    null_indices_bitmap.as_ref().map(|guard| &**guard),
+                    null_indices_bitmap.as_deref(),
                     probe_side_has_null,
                     probe_side_non_empty,
                 ))
@@ -1035,14 +1035,34 @@ fn mark_null_candidates_for_probe_batch(
         return internal_err!("null-aware mark scope map must be a hash map");
     };
 
-    hashes_buffer.clear();
-    hashes_buffer.resize(state.batch.num_rows(), 0);
-    create_hashes(&state.values[1..], random_state, hashes_buffer)?;
+    // Key layout (consumed positionally below): index 0 is the `NOT IN` value
+    // key; indices 1..N are the correlation scope keys.
+    debug_assert!(
+        build_side.left_data.values().len() > 1,
+        "build keys must be [value, scope..]"
+    );
+    debug_assert!(
+        state.values.len() > 1,
+        "probe keys must be [value, scope..]"
+    );
+    debug_assert_eq!(
+        build_side.left_data.values().len(),
+        state.values.len(),
+        "build/probe key counts must match"
+    );
 
     let build_value_key = &build_side.left_data.values()[0];
     let probe_value_key = &state.values[0];
     let build_scope_values = &build_side.left_data.values()[1..];
     let probe_scope_values = &state.values[1..];
+
+    if build_value_key.null_count() == 0 && probe_value_key.null_count() == 0 {
+        return Ok(());
+    }
+
+    hashes_buffer.clear();
+    hashes_buffer.resize(state.batch.num_rows(), 0);
+    create_hashes(&state.values[1..], random_state, hashes_buffer)?;
 
     let mut offset = (0, None);
     loop {

@@ -256,11 +256,28 @@ fn output_join_field(old_field: &Field, join_type: &JoinType, is_left: bool) -> 
 }
 
 /// Creates a schema for a join operation.
-/// The fields from the left side are first
+/// The fields from the left side are first.
+///
+/// The `mark` column of a mark join is non-nullable. Use
+/// [`build_join_schema_with_null_aware`] for null-aware mark joins, whose mark
+/// column can be `NULL` (SQL UNKNOWN).
 pub fn build_join_schema(
     left: &Schema,
     right: &Schema,
     join_type: &JoinType,
+) -> (Schema, Vec<ColumnIndex>) {
+    build_join_schema_with_null_aware(left, right, join_type, false)
+}
+
+/// Like [`build_join_schema`], but makes the `LeftMark`/`RightMark` `mark`
+/// column nullable when `null_aware` is set, so it can represent SQL UNKNOWN
+/// for null-aware `NOT IN` semantics. `null_aware` has no effect on non-mark
+/// join types.
+pub fn build_join_schema_with_null_aware(
+    left: &Schema,
+    right: &Schema,
+    join_type: &JoinType,
+    null_aware: bool,
 ) -> (Schema, Vec<ColumnIndex>) {
     let left_fields = || {
         left.fields()
@@ -303,7 +320,7 @@ pub fn build_join_schema(
         JoinType::LeftSemi | JoinType::LeftAnti => left_fields().unzip(),
         JoinType::LeftMark => {
             let right_field = once((
-                Field::new("mark", DataType::Boolean, true),
+                Field::new("mark", DataType::Boolean, null_aware),
                 ColumnIndex {
                     index: 0,
                     side: JoinSide::None,
@@ -314,7 +331,7 @@ pub fn build_join_schema(
         JoinType::RightSemi | JoinType::RightAnti => right_fields().unzip(),
         JoinType::RightMark => {
             let left_field = once((
-                Field::new("mark", DataType::Boolean, true),
+                Field::new("mark", DataType::Boolean, null_aware),
                 ColumnIndex {
                     index: 0,
                     side: JoinSide::None,

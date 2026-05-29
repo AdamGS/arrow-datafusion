@@ -143,7 +143,6 @@ use datafusion_common::{
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::memory_pool::MemoryReservation;
-use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_expr_common::physical_expr::PhysicalExprRef;
 
 use futures::{Stream, StreamExt, ready};
@@ -296,7 +295,7 @@ pub(crate) struct BitwiseSortMergeJoinStream {
     // batch is a single batch at a time and cannot be spilled.
     reservation: MemoryReservation,
     spill_manager: SpillManager,
-    runtime_env: Arc<RuntimeEnv>,
+    runtime_env: Arc<datafusion_execution::runtime_env::RuntimeEnv>,
     inner_buffer_size: usize,
 
     // Cached comparators — pre-built to avoid per-row type dispatch.
@@ -333,7 +332,7 @@ impl BitwiseSortMergeJoinStream {
         metrics: &ExecutionPlanMetricsSet,
         reservation: MemoryReservation,
         spill_manager: SpillManager,
-        runtime_env: Arc<RuntimeEnv>,
+        runtime_env: Arc<datafusion_execution::runtime_env::RuntimeEnv>,
     ) -> Result<Self> {
         debug_assert!(
             matches!(
@@ -558,7 +557,6 @@ impl BitwiseSortMergeJoinStream {
                     batch.num_columns() + 1,
                     "Mark join output schema should be outer schema + 1 mark column"
                 );
-
                 let mark_col = Arc::new(BooleanArray::new(matched_buf, None)) as ArrayRef;
                 let mut columns = Vec::with_capacity(batch.num_columns() + 1);
                 columns.extend_from_slice(batch.columns());
