@@ -932,25 +932,23 @@ impl HashJoinStream {
             // Null-aware LeftAnti remains single-key only.
             let build_key_column = &build_side.left_data.values()[0];
 
-            // Filter out indices where the key is NULL
             let filtered_indices: Vec<u64> = left_side
                 .iter()
                 .filter_map(|idx| {
-                    let idx_usize = idx.unwrap() as usize;
+                    let idx = idx.expect(
+                        "LeftAnti final indices should always contain build-side rows",
+                    );
+                    let idx_usize = idx as usize;
                     if build_key_column.is_null(idx_usize) {
                         None // Skip rows with NULL keys
                     } else {
-                        Some(idx.unwrap())
+                        Some(idx)
                     }
                 })
                 .collect();
 
             left_side = UInt64Array::from(filtered_indices);
-
-            // Update right_side to match the new length
-            let mut builder = arrow::array::UInt32Builder::with_capacity(left_side.len());
-            builder.append_nulls(left_side.len());
-            right_side = builder.finish();
+            right_side = UInt32Array::new_null(left_side.len());
         }
 
         self.join_metrics.input_batches.add(1);
@@ -1015,7 +1013,7 @@ impl HashJoinStream {
 }
 
 fn mark_null_candidates_for_probe_batch(
-    build_side: &mut BuildSideReadyState,
+    build_side: &BuildSideReadyState,
     state: &ProcessProbeBatchState,
     random_state: &RandomState,
     batch_size: usize,
@@ -1062,8 +1060,9 @@ fn mark_null_candidates_for_probe_batch(
 
     hashes_buffer.clear();
     hashes_buffer.resize(state.batch.num_rows(), 0);
-    create_hashes(&state.values[1..], random_state, hashes_buffer)?;
+    create_hashes(probe_scope_values, random_state, hashes_buffer)?;
 
+    let mut null_bitmap = build_side.left_data.null_indices_bitmap().lock();
     let mut offset = (0, None);
     loop {
         let (build_indices, probe_indices, next_offset) = lookup_join_hashmap(
@@ -1079,7 +1078,6 @@ fn mark_null_candidates_for_probe_batch(
         )?;
 
         if !build_indices.is_empty() {
-            let mut null_bitmap = build_side.left_data.null_indices_bitmap().lock();
             build_indices.iter().zip(probe_indices.iter()).for_each(
                 |(build_idx, probe_idx)| {
                     let build_idx = build_idx

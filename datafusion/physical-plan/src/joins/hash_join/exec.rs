@@ -1894,6 +1894,29 @@ fn should_collect_min_max_for_perfect_hash(
     Ok(ArrayMap::is_supported_type(&data_type))
 }
 
+fn new_join_hashmap(
+    num_rows: usize,
+    reservation: &mut MemoryReservation,
+    metrics: &BuildProbeJoinMetrics,
+) -> Result<Box<dyn JoinHashMapType>> {
+    let fixed_size_u32 = size_of::<JoinHashMapU32>();
+    let fixed_size_u64 = size_of::<JoinHashMapU64>();
+
+    if num_rows > u32::MAX as usize {
+        let estimated_hashtable_size =
+            estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
+        reservation.try_grow(estimated_hashtable_size)?;
+        metrics.build_mem_used.add(estimated_hashtable_size);
+        Ok(Box::new(JoinHashMapU64::with_capacity(num_rows)))
+    } else {
+        let estimated_hashtable_size =
+            estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
+        reservation.try_grow(estimated_hashtable_size)?;
+        metrics.build_mem_used.add(estimated_hashtable_size);
+        Ok(Box::new(JoinHashMapU32::with_capacity(num_rows)))
+    }
+}
+
 /// Collects all batches from the left (build) side stream and creates a hash map for joining.
 ///
 /// This function is responsible for:
@@ -2016,25 +2039,10 @@ async fn collect_left_input(
         } else {
             // Estimation of memory size, required for hashtable, prior to allocation.
             // Final result can be verified using `RawTable.allocation_info()`
-            let fixed_size_u32 = size_of::<JoinHashMapU32>();
-            let fixed_size_u64 = size_of::<JoinHashMapU64>();
-
             // Use `u32` indices for the JoinHashMap when num_rows ≤ u32::MAX, otherwise use the
             // `u64` indice variant
             // Arc is used instead of Box to allow sharing with SharedBuildAccumulator for hash map pushdown
-            let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
-                let estimated_hashtable_size =
-                    estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-                reservation.try_grow(estimated_hashtable_size)?;
-                metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU64::with_capacity(num_rows))
-            } else {
-                let estimated_hashtable_size =
-                    estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-                reservation.try_grow(estimated_hashtable_size)?;
-                metrics.build_mem_used.add(estimated_hashtable_size);
-                Box::new(JoinHashMapU32::with_capacity(num_rows))
-            };
+            let mut hashmap = new_join_hashmap(num_rows, &mut reservation, &metrics)?;
 
             let mut hashes_buffer = Vec::new();
             let mut offset = 0;
@@ -2100,21 +2108,7 @@ async fn collect_left_input(
         // This secondary map is keyed only by correlation scope keys. The
         // primary join map may still use ArrayMap for full-key TRUE matches,
         // but scope-only NULL marking uses a HashMap for arbitrary key shapes.
-        let fixed_size_u32 = size_of::<JoinHashMapU32>();
-        let fixed_size_u64 = size_of::<JoinHashMapU64>();
-        let mut hashmap: Box<dyn JoinHashMapType> = if num_rows > u32::MAX as usize {
-            let estimated_hashtable_size =
-                estimate_memory_size::<(u64, u64)>(num_rows, fixed_size_u64)?;
-            reservation.try_grow(estimated_hashtable_size)?;
-            metrics.build_mem_used.add(estimated_hashtable_size);
-            Box::new(JoinHashMapU64::with_capacity(num_rows))
-        } else {
-            let estimated_hashtable_size =
-                estimate_memory_size::<(u32, u64)>(num_rows, fixed_size_u32)?;
-            reservation.try_grow(estimated_hashtable_size)?;
-            metrics.build_mem_used.add(estimated_hashtable_size);
-            Box::new(JoinHashMapU32::with_capacity(num_rows))
-        };
+        let mut hashmap = new_join_hashmap(num_rows, &mut reservation, &metrics)?;
 
         let mut hashes_buffer = vec![0; batch.num_rows()];
         update_hash(

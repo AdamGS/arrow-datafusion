@@ -1597,6 +1597,9 @@ impl DefaultPhysicalPlanner {
 
                 let prefer_hash_join =
                     session_state.config_options().optimizer.prefer_hash_join;
+                let can_repartition_join = session_state.config().target_partitions() > 1
+                    && session_state.config().repartition_joins()
+                    && !*null_aware;
 
                 // TODO: Allow PWMJ to deal with residual equijoin conditions
                 let join: Arc<dyn ExecutionPlan> = if join_on.is_empty() {
@@ -1725,11 +1728,7 @@ impl DefaultPhysicalPlanner {
                             None,
                         )?)
                     }
-                } else if session_state.config().target_partitions() > 1
-                    && session_state.config().repartition_joins()
-                    && !prefer_hash_join
-                    && !*null_aware
-                {
+                } else if can_repartition_join && !prefer_hash_join {
                     // Use SortMergeJoin if hash join is not preferred
                     let join_on_len = join_on.len();
                     Arc::new(SortMergeJoinExec::try_new(
@@ -1741,24 +1740,15 @@ impl DefaultPhysicalPlanner {
                         vec![SortOptions::default(); join_on_len],
                         *null_equality,
                     )?)
-                } else if session_state.config().target_partitions() > 1
-                    && session_state.config().repartition_joins()
-                    && prefer_hash_join
-                    && !*null_aware
-                // Null-aware joins must use CollectLeft
-                {
-                    Arc::new(HashJoinExec::try_new(
-                        physical_left,
-                        physical_right,
-                        join_on,
-                        join_filter,
-                        join_type,
-                        None,
-                        PartitionMode::Auto,
-                        *null_equality,
-                        *null_aware,
-                    )?)
                 } else {
+                    // Null-aware joins need global probe-side state, so keep
+                    // them in CollectLeft mode.
+                    let partition_mode = if can_repartition_join {
+                        PartitionMode::Auto
+                    } else {
+                        PartitionMode::CollectLeft
+                    };
+
                     Arc::new(HashJoinExec::try_new(
                         physical_left,
                         physical_right,
@@ -1766,7 +1756,7 @@ impl DefaultPhysicalPlanner {
                         join_filter,
                         join_type,
                         None,
-                        PartitionMode::CollectLeft,
+                        partition_mode,
                         *null_equality,
                         *null_aware,
                     )?)
