@@ -435,6 +435,46 @@ set datafusion.execution.target_partitions = 1;
 statement ok
 set datafusion.optimizer.prefer_hash_join = true;
 
+# A marker inside an OR is not consumed by PushDownFilter, so this keeps a real
+# nested loop mark join. The NULL id compares UNKNOWN to every inner row; its
+# mark must be FALSE, not NULL, so that `NOT mark` keeps row 'e'.
+query TT
+EXPLAIN SELECT value
+FROM outer_table
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM inner_table_no_null
+    WHERE outer_table.id < inner_table_no_null.id
+) OR value = 'zzz';
+----
+logical_plan
+01)Projection: outer_table.value
+02)--Filter: NOT __correlated_sq_1.mark OR outer_table.value = Utf8View("zzz")
+03)----Projection: outer_table.value, __correlated_sq_1.mark
+04)------LeftMark Join:  Filter: outer_table.id < __correlated_sq_1.id
+05)--------TableScan: outer_table projection=[id, value]
+06)--------SubqueryAlias: __correlated_sq_1
+07)----------TableScan: inner_table_no_null projection=[id]
+physical_plan
+01)FilterExec: NOT mark@1 OR value@0 = zzz, projection=[value@0]
+02)--NestedLoopJoinExec: join_type=RightMark, filter=id@0 < id@1, projection=[value@1, mark@2]
+03)----DataSourceExec: partitions=1, partition_sizes=[1]
+04)----DataSourceExec: partitions=1, partition_sizes=[1]
+
+query T rowsort
+SELECT value
+FROM outer_table
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM inner_table_no_null
+    WHERE outer_table.id < inner_table_no_null.id
+) OR value = 'zzz';
+----
+d
+e
+
+# A whole-conjunct `IS TRUE` marker is consumed by PushDownFilter, which turns
+# the mark join into a semi join (see push_down_filter_mark_join.slt).
 query TT
 EXPLAIN SELECT value
 FROM outer_table

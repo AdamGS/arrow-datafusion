@@ -2457,6 +2457,7 @@ dependencies = [
  "recursive",
  "regex",
  "regex-syntax",
+ "rstest",
 ]
 
 [[package]]
