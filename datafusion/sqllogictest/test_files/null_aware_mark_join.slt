@@ -473,8 +473,8 @@ WHERE NOT EXISTS (
 d
 e
 
-# A whole-conjunct `IS TRUE` marker is consumed by PushDownFilter, which turns
-# the mark join into a semi join (see push_down_filter_mark_join.slt).
+# A whole-conjunct `IS TRUE` marker turns the mark join into a semi join
+# (see mark_join_to_semi_anti.slt).
 query TT
 EXPLAIN SELECT value
 FROM outer_table
