@@ -30,8 +30,8 @@ use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
 use datafusion_common::{
-    Column, DFSchema, NullEquality, Result, ScalarValue, TableReference,
-    assert_eq_or_internal_err, internal_err, plan_err, qualified_name,
+    Column, DFSchema, NullEquality, Result, ScalarValue, assert_eq_or_internal_err,
+    internal_err, plan_err, qualified_name,
 };
 use datafusion_expr::expr::WindowFunction;
 use datafusion_expr::expr_rewriter::replace_col;
@@ -590,18 +590,24 @@ fn classify_mark_predicate(
     }
 }
 
-/// Preserve the mark join's output schema, including for positional aliases.
+/// Restores the output schema of a converted mark join, including for
+/// positional consumers such as `SubqueryAlias`: the preserved columns followed
+/// by the vanished mark, re-exposed as the constant every surviving row has.
 struct MarkJoinRewrite {
-    preserved: Vec<Expr>,
-    qualifier: Option<TableReference>,
-    name: String,
-    value: Expr,
+    /// Schema of the join before conversion; its last field is the mark.
+    schema: Arc<DFSchema>,
+    /// The mark value selected by the consumed predicate.
+    mark_value: bool,
 }
 
 impl MarkJoinRewrite {
     fn restore_mark_column(self, plan: LogicalPlan) -> Result<LogicalPlan> {
-        let mut exprs = self.preserved;
-        exprs.push(self.value.alias_qualified(self.qualifier, self.name));
+        let mut columns = self.schema.columns();
+        let mark = columns
+            .pop()
+            .expect("a mark join schema ends with the mark column");
+        let mut exprs: Vec<Expr> = columns.into_iter().map(Expr::Column).collect();
+        exprs.push(lit(self.mark_value).alias_qualified(mark.relation, mark.name));
         Ok(LogicalPlan::Projection(Projection::try_new(
             exprs,
             Arc::new(plan),
@@ -624,16 +630,21 @@ fn try_convert_mark_join(
     let mark_idx = schema.fields().len() - 1;
     // A lower mark join may contribute another column named "mark". Resolve
     // the qualified column against this join's schema to distinguish them.
-    let is_mark = |expr: &Expr| matches!(expr, Expr::Column(col) if schema.maybe_index_of_column(col) == Some(mark_idx));
+    let is_mark_col = |col: &Column| schema.maybe_index_of_column(col) == Some(mark_idx);
+    let is_mark = |expr: &Expr| matches!(expr, Expr::Column(col) if is_mark_col(col));
     let Some((idx, value)) = predicates.iter().enumerate().find_map(|(idx, expr)| {
         classify_mark_predicate(expr, &is_mark).map(|value| (idx, value))
     }) else {
         return Ok(None);
     };
 
-    // Non-null-aware marks are two-valued despite their nullable schema field.
-    // IS NOT TRUE could select an anti join even for a null-aware mark, but
-    // restoring its marker as false would lose the original NULL values.
+    // A non-null-aware mark is two-valued despite its nullable schema field, so
+    // selecting its FALSE rows is exactly a plain anti join. Null-aware marks
+    // are three-valued and are left alone: `NOT mark` / `IS FALSE` keep only
+    // the FALSE rows, which only a *null-aware* anti join reproduces (a
+    // possible extension, subject to that join's single-key constraint), and
+    // `IS NOT TRUE` keeps the FALSE and NULL rows, which a plain anti join
+    // reproduces but the restored constant marker could not.
     if matches!(value, MarkValue::False) && join.null_aware {
         return Ok(None);
     }
@@ -645,27 +656,23 @@ fn try_convert_mark_join(
         (JoinType::RightMark, MarkValue::False) => JoinType::RightAnti,
         _ => unreachable!(),
     };
-    let value = lit(matches!(value, MarkValue::True));
-    let (qualifier, field) = schema.qualified_field(mark_idx);
+    let mark_value = matches!(value, MarkValue::True);
     let rewrite = MarkJoinRewrite {
-        preserved: (0..mark_idx)
-            .map(|idx| {
-                let (qualifier, field) = schema.qualified_field(idx);
-                Expr::Column(Column::new(qualifier.cloned(), field.name()))
-            })
-            .collect(),
-        qualifier: qualifier.cloned(),
-        name: field.name().clone(),
-        value: value.clone(),
+        schema: Arc::clone(&schema),
+        mark_value,
     };
 
+    // Every surviving row has the selected mark value, so any other reference
+    // to the vanished mark is replaced by that constant.
     predicates.remove(idx);
     for predicate in predicates.iter_mut() {
-        *predicate = predicate
-            .clone()
+        if !predicate.column_refs().into_iter().any(is_mark_col) {
+            continue;
+        }
+        *predicate = std::mem::take(predicate)
             .transform_down(|expr| {
                 if is_mark(&expr) {
-                    Ok(Transformed::yes(value.clone()))
+                    Ok(Transformed::yes(lit(mark_value)))
                 } else {
                     Ok(Transformed::no(expr))
                 }
@@ -675,12 +682,6 @@ fn try_convert_mark_join(
     predicates.retain(|expr| {
         !matches!(expr, Expr::Literal(ScalarValue::Boolean(Some(true)), _))
     });
-    // Any predicates kept above the converted join must not read its vanished mark.
-    debug_assert!(predicates.iter().all(|expr| {
-        expr.column_refs()
-            .iter()
-            .all(|col| schema.maybe_index_of_column(col) != Some(mark_idx))
-    }));
 
     join.join_type = new_type;
     join.null_aware = false;
@@ -1683,6 +1684,7 @@ mod tests {
     use crate::test::*;
     use datafusion_expr::test::function_stub::sum;
     use insta::assert_snapshot;
+    use rstest::rstest;
 
     use super::*;
 
@@ -1902,22 +1904,27 @@ mod tests {
         ")
     }
 
-    #[test]
-    fn null_aware_mark_join_blocks_anti_conversion() -> Result<()> {
-        let mark = col("test2.mark");
-        for predicate in [
-            mark.clone().not(),
-            mark.clone().is_false(),
-            mark.clone().is_not_true(),
-            binary_expr(mark.clone(), Operator::IsDistinctFrom, lit(true)),
-            binary_expr(lit(true), Operator::IsDistinctFrom, mark),
-        ] {
-            let plan =
-                LogicalPlanBuilder::from(mark_join_plan(JoinType::LeftMark, true)?)
-                    .filter(predicate)?
-                    .build()?;
-            assert_plan_not_transformed!(plan);
-        }
+    #[rstest]
+    #[case::not(col("test2.mark").not())]
+    #[case::is_false(col("test2.mark").is_false())]
+    #[case::is_not_true(col("test2.mark").is_not_true())]
+    #[case::is_distinct_from_true(binary_expr(
+        col("test2.mark"),
+        Operator::IsDistinctFrom,
+        lit(true)
+    ))]
+    #[case::true_is_distinct_from(binary_expr(
+        lit(true),
+        Operator::IsDistinctFrom,
+        col("test2.mark")
+    ))]
+    fn null_aware_mark_join_blocks_anti_conversion(
+        #[case] predicate: Expr,
+    ) -> Result<()> {
+        let plan = LogicalPlanBuilder::from(mark_join_plan(JoinType::LeftMark, true)?)
+            .filter(predicate)?
+            .build()?;
+        assert_plan_not_transformed!(plan);
         Ok(())
     }
 
@@ -2079,105 +2086,99 @@ mod tests {
         table_scan(Some(name), &schema, None)?.build()
     }
 
-    #[test]
-    fn null_equals_null_flips_when_one_side_non_nullable() -> Result<()> {
-        for (left_nullable, right_nullable) in
-            [(false, true), (true, false), (false, false)]
-        {
-            for predicate in [col("test2.mark"), col("test2.mark").not()] {
-                let plan =
-                    LogicalPlanBuilder::from(nullable_mark_scan("test1", left_nullable)?)
-                        .join_detailed(
-                            nullable_mark_scan("test2", right_nullable)?,
-                            JoinType::LeftMark,
-                            (vec!["a"], vec!["a"]),
-                            None,
-                            NullEquality::NullEqualsNull,
-                        )?
-                        .filter(predicate)?
-                        .build()?;
-                let rewritten = PushDownFilter::new()
-                    .rewrite(plan, &OptimizerContext::new())?
-                    .data;
-                let LogicalPlan::Projection(projection) = rewritten else {
-                    panic!("expected projection")
-                };
-                let LogicalPlan::Join(join) = projection.input.as_ref() else {
-                    panic!("expected join")
-                };
-                assert_eq!(join.null_equality, NullEquality::NullEqualsNothing);
+    /// Runs `PushDownFilter` once and returns the join under the projection
+    /// that restores the mark column of a converted mark join.
+    fn converted_join(plan: LogicalPlan) -> Result<Join> {
+        let rewritten = PushDownFilter::new()
+            .rewrite(plan, &OptimizerContext::new())?
+            .data;
+        match rewritten {
+            LogicalPlan::Projection(projection) => {
+                match Arc::unwrap_or_clone(projection.input) {
+                    LogicalPlan::Join(join) => Ok(join),
+                    other => panic!("expected join, got {}", other.display_indent()),
+                }
             }
+            other => panic!("expected projection, got {}", other.display_indent()),
         }
+    }
+
+    #[rstest]
+    #[case::left_non_nullable(false, true)]
+    #[case::right_non_nullable(true, false)]
+    #[case::both_non_nullable(false, false)]
+    fn null_equals_null_flips_when_one_side_non_nullable(
+        #[case] left_nullable: bool,
+        #[case] right_nullable: bool,
+        #[values(col("test2.mark"), col("test2.mark").not())] predicate: Expr,
+    ) -> Result<()> {
+        let plan = LogicalPlanBuilder::from(nullable_mark_scan("test1", left_nullable)?)
+            .join_detailed(
+                nullable_mark_scan("test2", right_nullable)?,
+                JoinType::LeftMark,
+                (vec!["a"], vec!["a"]),
+                None,
+                NullEquality::NullEqualsNull,
+            )?
+            .filter(predicate)?
+            .build()?;
+        assert_eq!(
+            converted_join(plan)?.null_equality,
+            NullEquality::NullEqualsNothing
+        );
         Ok(())
     }
 
-    #[test]
-    fn null_equals_null_stays_when_both_nullable() -> Result<()> {
-        // A non-nullable key does not justify narrowing a second, nullable key.
-        for keys in [vec!["b"], vec!["a", "b"]] {
-            let plan = LogicalPlanBuilder::from(nullable_mark_scan("test1", false)?)
-                .join_detailed(
-                    nullable_mark_scan("test2", false)?,
-                    JoinType::LeftMark,
-                    (keys.clone(), keys),
-                    None,
-                    NullEquality::NullEqualsNull,
-                )?
-                .filter(col("test2.mark"))?
-                .build()?;
-            let rewritten = PushDownFilter::new()
-                .rewrite(plan, &OptimizerContext::new())?
-                .data;
-            let LogicalPlan::Projection(projection) = rewritten else {
-                panic!("expected projection")
-            };
-            let LogicalPlan::Join(join) = projection.input.as_ref() else {
-                panic!("expected join")
-            };
-            assert_eq!(join.null_equality, NullEquality::NullEqualsNull);
-        }
+    // A non-nullable key does not justify narrowing a second, nullable key.
+    #[rstest]
+    #[case::nullable_key(vec!["b"])]
+    #[case::mixed_keys(vec!["a", "b"])]
+    fn null_equals_null_stays_when_both_nullable(#[case] keys: Vec<&str>) -> Result<()> {
+        let plan = LogicalPlanBuilder::from(nullable_mark_scan("test1", false)?)
+            .join_detailed(
+                nullable_mark_scan("test2", false)?,
+                JoinType::LeftMark,
+                (keys.clone(), keys),
+                None,
+                NullEquality::NullEqualsNull,
+            )?
+            .filter(col("test2.mark"))?
+            .build()?;
+        assert_eq!(
+            converted_join(plan)?.null_equality,
+            NullEquality::NullEqualsNull
+        );
         Ok(())
     }
 
-    #[test]
-    fn residual_is_not_distinct_from_becomes_eq_when_one_side_non_nullable() -> Result<()>
-    {
-        for nullable in [false, true] {
-            for reverse in [false, true] {
-                // Expressions, including reversed operands, must use child nullability.
-                let left = col("test1.b") + lit(1u32);
-                let right = col("test2.a") + lit(1u32);
-                let (left, right) = if reverse {
-                    (right, left)
-                } else {
-                    (left, right)
-                };
-                let filter =
-                    binary_expr(left.clone(), Operator::IsNotDistinctFrom, right.clone());
-                let plan = LogicalPlanBuilder::from(nullable_mark_scan("test1", true)?)
-                    .join(
-                        nullable_mark_scan("test2", nullable)?,
-                        JoinType::LeftMark,
-                        (vec!["a"], vec!["a"]),
-                        Some(filter.clone()),
-                    )?
-                    .filter(col("test2.mark"))?
-                    .build()?;
-                let rewritten = PushDownFilter::new()
-                    .rewrite(plan, &OptimizerContext::new())?
-                    .data;
-                let LogicalPlan::Projection(projection) = rewritten else {
-                    panic!("expected projection")
-                };
-                let LogicalPlan::Join(join) = projection.input.as_ref() else {
-                    panic!("expected join")
-                };
-                assert_eq!(
-                    join.filter,
-                    Some(if nullable { filter } else { left.eq(right) })
-                );
-            }
-        }
+    // Expressions, including reversed operands, must use child nullability.
+    #[rstest]
+    fn residual_is_not_distinct_from_becomes_eq_when_one_side_non_nullable(
+        #[values(false, true)] nullable: bool,
+        #[values(false, true)] reverse: bool,
+    ) -> Result<()> {
+        let left = col("test1.b") + lit(1u32);
+        let right = col("test2.a") + lit(1u32);
+        let (left, right) = if reverse {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        let filter =
+            binary_expr(left.clone(), Operator::IsNotDistinctFrom, right.clone());
+        let plan = LogicalPlanBuilder::from(nullable_mark_scan("test1", true)?)
+            .join(
+                nullable_mark_scan("test2", nullable)?,
+                JoinType::LeftMark,
+                (vec!["a"], vec!["a"]),
+                Some(filter.clone()),
+            )?
+            .filter(col("test2.mark"))?
+            .build()?;
+        assert_eq!(
+            converted_join(plan)?.filter,
+            Some(if nullable { filter } else { left.eq(right) })
+        );
         Ok(())
     }
 
