@@ -550,37 +550,33 @@ fn push_down_all_join(
     )))
 }
 
-/// Returns the mark value selected by a whole conjunct, if any.
-fn classify_mark_predicate(
-    expr: &Expr,
-    is_mark: &impl Fn(&Expr) -> bool,
-) -> Option<bool> {
-    match expr {
-        Expr::Column(_) if is_mark(expr) => Some(true),
-        Expr::IsTrue(expr) if is_mark(expr) => Some(true),
-        Expr::Not(expr) | Expr::IsFalse(expr) | Expr::IsNotTrue(expr)
-            if is_mark(expr) =>
-        {
-            Some(false)
+/// Returns the column and value selected by a supported whole conjunct.
+fn mark_filter_column(expr: &Expr) -> Option<(&Column, bool)> {
+    let (candidate, value) = match expr {
+        Expr::Column(column) => return Some((column, true)),
+        Expr::IsTrue(inner) => (inner.as_ref(), true),
+        Expr::Not(inner) | Expr::IsFalse(inner) | Expr::IsNotTrue(inner) => {
+            (inner.as_ref(), false)
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right })
-            if (is_mark(left)
-                && matches!(
-                    right.as_ref(),
-                    Expr::Literal(ScalarValue::Boolean(Some(true)), _)
-                ))
-                || (is_mark(right)
-                    && matches!(
-                        left.as_ref(),
-                        Expr::Literal(ScalarValue::Boolean(Some(true)), _)
-                    )) =>
+            if matches!(op, Operator::IsDistinctFrom | Operator::IsNotDistinctFrom) =>
         {
-            match op {
-                Operator::IsNotDistinctFrom => Some(true),
-                Operator::IsDistinctFrom => Some(false),
-                _ => None,
-            }
+            let is_true = |expr: &Expr| {
+                matches!(expr, Expr::Literal(ScalarValue::Boolean(Some(true)), _))
+            };
+            let candidate = if is_true(left) {
+                right.as_ref()
+            } else if is_true(right) {
+                left.as_ref()
+            } else {
+                return None;
+            };
+            (candidate, *op == Operator::IsNotDistinctFrom)
         }
+        _ => return None,
+    };
+    match candidate {
+        Expr::Column(column) => Some((column, value)),
         _ => None,
     }
 }
@@ -626,10 +622,12 @@ fn try_convert_mark_join(
     // A lower mark join may contribute another column named "mark". Resolve
     // the qualified column against this join's schema to distinguish them.
     let is_mark_col = |col: &Column| schema.maybe_index_of_column(col) == Some(mark_idx);
-    let is_mark = |expr: &Expr| matches!(expr, Expr::Column(col) if is_mark_col(col));
-    let Some((idx, mark_value)) = predicates.iter().enumerate().find_map(|(idx, expr)| {
-        classify_mark_predicate(expr, &is_mark).map(|value| (idx, value))
-    }) else {
+    let Some((idx, mark_value)) =
+        predicates.iter().enumerate().find_map(|(idx, expr)| {
+            let (column, value) = mark_filter_column(expr)?;
+            is_mark_col(column).then_some((idx, value))
+        })
+    else {
         return Ok(None);
     };
 
@@ -665,7 +663,7 @@ fn try_convert_mark_join(
         }
         *predicate = std::mem::take(predicate)
             .transform_down(|expr| {
-                if is_mark(&expr) {
+                if matches!(&expr, Expr::Column(col) if is_mark_col(col)) {
                     Ok(Transformed::yes(lit(mark_value)))
                 } else {
                     Ok(Transformed::no(expr))
@@ -4574,7 +4572,7 @@ mod tests {
                 JoinType::LeftAnti,
                 (Vec::<Column>::new(), Vec::<Column>::new()),
                 Some(lit(3u32).eq(col("test2.a"))),
-                datafusion_common::NullEquality::NullEqualsNothing,
+                NullEquality::NullEqualsNothing,
                 true,
             )?
             .build()?;

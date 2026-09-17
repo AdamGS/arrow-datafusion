@@ -20,12 +20,6 @@
 # mark. Predicate spellings and schema edge cases are covered by unit tests.
 
 statement ok
-set datafusion.execution.target_partitions = 1;
-
-statement ok
-set datafusion.optimizer.filter_null_join_keys = false;
-
-statement ok
 set datafusion.explain.logical_plan_only = true;
 
 statement ok
@@ -36,11 +30,11 @@ CREATE TABLE pdm_inner(k BIGINT, g BIGINT) AS VALUES (2, 2), (2, 5), (NULL, 4);
 
 statement ok
 COPY (SELECT * FROM pdm_inner WHERE k IS NOT NULL)
-TO 'test_files/scratch/push_down_filter_mark_join/inner.parquet' STORED AS PARQUET;
+TO 'test_files/scratch/mark_join_to_semi_anti/inner.parquet' STORED AS PARQUET;
 
 statement ok
 CREATE EXTERNAL TABLE pdm_inner_nn(k BIGINT NOT NULL, g BIGINT NOT NULL)
-STORED AS PARQUET LOCATION 'test_files/scratch/push_down_filter_mark_join/inner.parquet';
+STORED AS PARQUET LOCATION 'test_files/scratch/mark_join_to_semi_anti/inner.parquet';
 
 statement ok
 CREATE VIEW pdm_exists AS
@@ -154,10 +148,13 @@ logical_plan
 10)--------------TableScan: pdm_inner projection=[k]
 physical_plan
 01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
-02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1))]
-03)----HashJoinExec: mode=CollectLeft, join_type=RightSemi, on=[(k@0, k@0)], projection=[], NullsEqual: true
-04)------DataSourceExec: partitions=1, partition_sizes=[1]
-05)------DataSourceExec: partitions=1, partition_sizes=[1]
+02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+03)----CoalescePartitionsExec
+04)------AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+06)----------HashJoinExec: mode=CollectLeft, join_type=RightSemi, on=[(k@0, k@0)], projection=[], NullsEqual: true
+07)------------DataSourceExec: partitions=1, partition_sizes=[1]
+08)------------DataSourceExec: partitions=1, partition_sizes=[1]
 
 query I rowsort
 SELECT count(*) FROM (
@@ -186,10 +183,13 @@ logical_plan
 10)--------------TableScan: pdm_inner_nn projection=[k]
 physical_plan
 01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
-02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1))]
-03)----HashJoinExec: mode=CollectLeft, join_type=RightSemi, on=[(k@0, k@0)], projection=[]
-04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/push_down_filter_mark_join/inner.parquet]]}, projection=[k], file_type=parquet
-05)------DataSourceExec: partitions=1, partition_sizes=[1]
+02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+03)----CoalescePartitionsExec
+04)------AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+06)----------HashJoinExec: mode=CollectLeft, join_type=RightSemi, on=[(k@0, k@0)], projection=[]
+07)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/mark_join_to_semi_anti/inner.parquet]]}, projection=[k], file_type=parquet
+08)------------DataSourceExec: partitions=1, partition_sizes=[1]
 
 query I rowsort
 SELECT count(*) FROM (
@@ -222,10 +222,13 @@ logical_plan
 11)----------------TableScan: pdm_inner_nn projection=[k, g]
 physical_plan
 01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
-02)--AggregateExec: mode=Single, gby=[], aggr=[count(Int64(1))]
-03)----HashJoinExec: mode=CollectLeft, join_type=RightSemi, on=[(g@0, id@0), (k@1, k@1)], projection=[]
-04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/push_down_filter_mark_join/inner.parquet]]}, projection=[g, k], file_type=parquet
-05)------DataSourceExec: partitions=1, partition_sizes=[1]
+02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+03)----CoalescePartitionsExec
+04)------AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+06)----------HashJoinExec: mode=CollectLeft, join_type=RightSemi, on=[(g@0, id@0), (k@1, k@1)], projection=[]
+07)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/mark_join_to_semi_anti/inner.parquet]]}, projection=[g, k], file_type=parquet
+08)------------DataSourceExec: partitions=1, partition_sizes=[1]
 
 query I rowsort
 SELECT count(*) FROM (
@@ -343,9 +346,6 @@ SELECT id, m FROM pdm_exists WHERE NOT m;
 1 false
 3 false
 4 false
-
-statement ok
-set datafusion.execution.target_partitions = 4;
 
 statement ok
 RESET datafusion.explain.logical_plan_only;
