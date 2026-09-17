@@ -550,23 +550,18 @@ fn push_down_all_join(
     )))
 }
 
-enum MarkValue {
-    True,
-    False,
-}
-
-/// Recognize whole conjuncts that select one value of a mark column.
+/// Returns the mark value selected by a whole conjunct, if any.
 fn classify_mark_predicate(
     expr: &Expr,
     is_mark: &impl Fn(&Expr) -> bool,
-) -> Option<MarkValue> {
+) -> Option<bool> {
     match expr {
-        Expr::Column(_) if is_mark(expr) => Some(MarkValue::True),
-        Expr::IsTrue(expr) if is_mark(expr) => Some(MarkValue::True),
+        Expr::Column(_) if is_mark(expr) => Some(true),
+        Expr::IsTrue(expr) if is_mark(expr) => Some(true),
         Expr::Not(expr) | Expr::IsFalse(expr) | Expr::IsNotTrue(expr)
             if is_mark(expr) =>
         {
-            Some(MarkValue::False)
+            Some(false)
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right })
             if (is_mark(left)
@@ -581,8 +576,8 @@ fn classify_mark_predicate(
                     )) =>
         {
             match op {
-                Operator::IsNotDistinctFrom => Some(MarkValue::True),
-                Operator::IsDistinctFrom => Some(MarkValue::False),
+                Operator::IsNotDistinctFrom => Some(true),
+                Operator::IsDistinctFrom => Some(false),
                 _ => None,
             }
         }
@@ -632,7 +627,7 @@ fn try_convert_mark_join(
     // the qualified column against this join's schema to distinguish them.
     let is_mark_col = |col: &Column| schema.maybe_index_of_column(col) == Some(mark_idx);
     let is_mark = |expr: &Expr| matches!(expr, Expr::Column(col) if is_mark_col(col));
-    let Some((idx, value)) = predicates.iter().enumerate().find_map(|(idx, expr)| {
+    let Some((idx, mark_value)) = predicates.iter().enumerate().find_map(|(idx, expr)| {
         classify_mark_predicate(expr, &is_mark).map(|value| (idx, value))
     }) else {
         return Ok(None);
@@ -645,18 +640,17 @@ fn try_convert_mark_join(
     // possible extension, subject to that join's single-key constraint), and
     // `IS NOT TRUE` keeps the FALSE and NULL rows, which a plain anti join
     // reproduces but the restored constant marker could not.
-    if matches!(value, MarkValue::False) && join.null_aware {
+    if !mark_value && join.null_aware {
         return Ok(None);
     }
 
-    let new_type = match (join.join_type, &value) {
-        (JoinType::LeftMark, MarkValue::True) => JoinType::LeftSemi,
-        (JoinType::LeftMark, MarkValue::False) => JoinType::LeftAnti,
-        (JoinType::RightMark, MarkValue::True) => JoinType::RightSemi,
-        (JoinType::RightMark, MarkValue::False) => JoinType::RightAnti,
+    let new_type = match (join.join_type, mark_value) {
+        (JoinType::LeftMark, true) => JoinType::LeftSemi,
+        (JoinType::LeftMark, false) => JoinType::LeftAnti,
+        (JoinType::RightMark, true) => JoinType::RightSemi,
+        (JoinType::RightMark, false) => JoinType::RightAnti,
         _ => unreachable!(),
     };
-    let mark_value = matches!(value, MarkValue::True);
     let rewrite = MarkJoinRewrite {
         schema: Arc::clone(&schema),
         mark_value,
