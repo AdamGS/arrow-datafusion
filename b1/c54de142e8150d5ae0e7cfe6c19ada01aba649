@@ -1,0 +1,19 @@
+datafusion/core/tests/sql/union_metadata.rs
+  s_6edd1de2e701fa::t_6ef182131ecb53 1-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b1c54de142e8150d5ae0e7cfe6c19ada01aba649",
+  "prompts": {},
+  "sessions": {
+    "s_6edd1de2e701fa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8b8d0490-4620-4ccb-bc00-dc4e88abc334",
+        "model": "unknown"
+      },
+      "human_author": "Adam Gutglick <adamgsal@gmail.com>"
+    }
+  }
+}
