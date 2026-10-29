@@ -1,0 +1,25 @@
+datafusion/physical-plan/src/union.rs
+  s_6edd1de2e701fa::t_363284b618c0bf 36,39,1001,1008-1010,1012,1014-1016,1018-1021,1025-1026,1028,1108,1718-1725,1751,1759,1761
+datafusion/common/src/metadata.rs
+  s_6edd1de2e701fa::t_a6d02a933d6433 125-157
+datafusion/expr/src/expr.rs
+  s_6edd1de2e701fa::t_dde783b1e58c64 636-639,4677
+datafusion/sqllogictest/test_files/metadata.slt
+  s_6edd1de2e701fa::t_48c3c4938004d0 130-132,174-201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1e19e75fb1e4397e6cb8ab07b8b9b51d3625e47a",
+  "prompts": {},
+  "sessions": {
+    "s_6edd1de2e701fa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8b8d0490-4620-4ccb-bc00-dc4e88abc334",
+        "model": "unknown"
+      },
+      "human_author": "Adam Gutglick <adamgsal@gmail.com>"
+    }
+  }
+}
