@@ -1,0 +1,21 @@
+datafusion/sqllogictest/test_files/parquet_filter_pushdown.slt
+  s_9e1d16eadbd1d6::t_e358f87d32cfcc 1089-1125
+datafusion/sqllogictest/test_files/simplify_expr.slt
+  s_9e1d16eadbd1d6::t_9da7f5176d028a 383-461,516-581
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4694929489ec2f3c8a52c31792dff5cf98a69252",
+  "prompts": {},
+  "sessions": {
+    "s_9e1d16eadbd1d6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "87f9baf4-fd9f-4a33-936d-7a4a6e19b679",
+        "model": "unknown"
+      },
+      "human_author": "Adam Gutglick <adamgsal@gmail.com>"
+    }
+  }
+}
