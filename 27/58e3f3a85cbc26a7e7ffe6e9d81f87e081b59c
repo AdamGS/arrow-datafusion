@@ -1,0 +1,19 @@
+datafusion/sqllogictest/test_files/datetime/timestamps_timezone.slt
+  s_9e1d16eadbd1d6::t_7c3624a612dd7e 28,626-733
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2758e3f3a85cbc26a7e7ffe6e9d81f87e081b59c",
+  "prompts": {},
+  "sessions": {
+    "s_9e1d16eadbd1d6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "87f9baf4-fd9f-4a33-936d-7a4a6e19b679",
+        "model": "unknown"
+      },
+      "human_author": "Adam Gutglick <adamgsal@gmail.com>"
+    }
+  }
+}
